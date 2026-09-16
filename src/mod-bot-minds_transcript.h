@@ -1,10 +1,12 @@
 #ifndef MOD_BOT_MINDS_TRANSCRIPT_H
 #define MOD_BOT_MINDS_TRANSCRIPT_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 class Player;
+class Channel;
 
 // --------------------------------------------
 // Where a line was spoken. One transcript is kept per scope instance, so party
@@ -22,9 +24,17 @@ enum class ChatScope : uint8_t
 struct ScopeKey
 {
     ChatScope scope = ChatScope::Say;
-    uint32_t  id    = 0;   // zone for Say, group/guild/channel id, human's guid for Whisper
+    uint64_t  id    = 0;   // local audience for Say, group/guild/channel id, bot's guid for Whisper
 
     bool operator==(const ScopeKey& other) const { return scope == other.scope && id == other.id; }
+};
+
+struct ScopeKeyHash
+{
+    size_t operator()(ScopeKey const& key) const
+    {
+        return (static_cast<size_t>(key.id) << 3) ^ static_cast<size_t>(key.scope);
+    }
 };
 
 // The bot a particular person is in conversation with, and when it last answered
@@ -39,9 +49,19 @@ struct FloorHolder
     uint32_t atSec = 0;
 };
 
-// Build the key for a scope. `counterpart` is only needed for Whisper, where it
-// identifies the other end of the thread; `channelId` only for Channel.
-ScopeKey MakeScope(ChatScope scope, Player* actor, Player* counterpart = nullptr, uint32_t channelId = 0);
+// Build the key for a scope. Say is anchored to `counterpart` when supplied, or
+// `actor` otherwise, so two distant conversations in one zone never share chat
+// history or pacing. Whisper uses `counterpart`. A channel key includes its exact
+// localized name and faction because General has the same numeric id in every zone.
+ScopeKey MakeScope(ChatScope scope, Player* actor, Player* counterpart = nullptr,
+                   uint32_t channelId = 0, const std::string& channelName = "");
+
+// AzerothCore's public Player::IsInChannel helper only compares the numeric DBC
+// id, which is shared by every localized General instance. Add the zone/city
+// identity checks needed to tell whether this exact channel is one the player can
+// actually hear. Custom channels are excluded because core exposes no exact
+// public membership query for them.
+bool IsInChannelInstance(Player* player, Channel const* channel);
 
 // Human-readable name of a scope, for logs.
 const char* ScopeName(ChatScope scope);

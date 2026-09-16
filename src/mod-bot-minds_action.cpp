@@ -70,7 +70,10 @@ namespace
             { "cheer",  TEXT_EMOTE_CHEER },
             { "salute", TEXT_EMOTE_SALUTE },
             { "bow",    TEXT_EMOTE_BOW },
-            { "sigh",   TEXT_EMOTE_SIGH }
+            { "sigh",   TEXT_EMOTE_SIGH },
+            { "point",  TEXT_EMOTE_POINT },
+            { "ponder", TEXT_EMOTE_PONDER },
+            { "toast",  TEXT_EMOTE_TOAST }
         };
 
         auto it = allowed.find(name);
@@ -137,6 +140,83 @@ namespace
             case CLASS_SHAMAN:  return shaman;
             default:            return none;
         }
+    }
+
+    const std::vector<std::string>& ResurrectionsForClass(uint8 cls)
+    {
+        static const std::vector<std::string> none;
+        static const std::vector<std::string> priest  = { "resurrection" };
+        static const std::vector<std::string> paladin = { "redemption" };
+        static const std::vector<std::string> druid   = { "revive" };
+        static const std::vector<std::string> shaman  = { "ancestral spirit" };
+
+        switch (cls)
+        {
+            case CLASS_PRIEST:  return priest;
+            case CLASS_PALADIN: return paladin;
+            case CLASS_DRUID:   return druid;
+            case CLASS_SHAMAN:  return shaman;
+            default:            return none;
+        }
+    }
+
+    bool HasAnyPaladinBlessing(PlayerbotAI* botAI, Player* target)
+    {
+        static char const* blessings[] = {
+            "blessing of might", "blessing of wisdom", "blessing of kings", "blessing of sanctuary",
+            "greater blessing of might", "greater blessing of wisdom", "greater blessing of kings",
+            "greater blessing of sanctuary"
+        };
+
+        for (char const* blessing : blessings)
+            if (botAI->GetAura(blessing, target))
+                return true;
+        return false;
+    }
+
+    uint32_t PasserbyBuffScore(std::string const& name, Player* target)
+    {
+        bool const tank = PlayerbotAI::IsTank(target, /*bySpec=*/true);
+        bool const melee = PlayerbotAI::IsMelee(target, /*bySpec=*/true);
+        bool const caster = PlayerbotAI::IsCaster(target, /*bySpec=*/true);
+        bool const usesMana = target->getPowerType() == POWER_MANA;
+
+        if (name == "power word: fortitude")
+            return 120;
+        if (name == "divine spirit")
+            return caster || usesMana ? 105 : 35;
+        if (name == "shadow protection")
+            return 45;
+        if (name == "power word: shield" || name == "fear ward")
+            return 0;
+
+        if (name == "arcane intellect")
+            return caster || usesMana ? 115 : 0;
+        if (name == "slow fall")
+            return target->IsFalling() ? 140 : 0;
+        if (name == "dampen magic" || name == "amplify magic")
+            return 0;
+
+        if (name == "mark of the wild")
+            return 118;
+        if (name == "thorns")
+            return tank ? 100 : (melee ? 75 : 20);
+
+        if (name == "blessing of sanctuary")
+            return tank ? 125 : 25;
+        if (name == "blessing of might")
+            return melee && !caster ? 115 : 20;
+        if (name == "blessing of wisdom")
+            return caster || usesMana ? 115 : 0;
+        if (name == "blessing of kings")
+            return 110;
+
+        if (name == "water walking")
+            return target->IsInWater() && !target->IsUnderWater() ? 90 : 0;
+        if (name == "water breathing" || name == "unending breath")
+            return target->IsInWater() || target->IsUnderWater() ? 100 : 0;
+
+        return 0;
     }
 
     uint32 ResolveSpellId(PlayerbotAI* botAI, const std::string& name)
@@ -382,6 +462,66 @@ ActionMenu BuildActionMenu(Player* bot, Player* other, bool unprompted)
     return menu;
 }
 
+PasserbyBuffChoice ChoosePasserbyBuff(Player* bot, Player* other, const ActionMenu& menu)
+{
+    PasserbyBuffChoice choice;
+    if (!bot || !other || menu.buffs.empty())
+        return choice;
+
+    PlayerbotAI* botAI = BotAIFor(bot);
+    if (!botAI)
+        return choice;
+
+    // Paladin blessings are mutually exclusive. Replacing somebody's existing
+    // choice without being asked is more annoying than helpful.
+    if (bot->getClass() == CLASS_PALADIN && HasAnyPaladinBlessing(botAI, other))
+        return choice;
+
+    for (std::string const& spellName : menu.buffs)
+    {
+        uint32_t const score = PasserbyBuffScore(spellName, other);
+        if (score > choice.score)
+        {
+            choice.spellName = spellName;
+            choice.score = score;
+        }
+    }
+
+    return choice;
+}
+
+std::string ChooseRecoverySpell(Player* bot, Player* other, bool resurrect)
+{
+    if (!g_ActionsEnable || !bot || !other || bot == other)
+        return "";
+
+    PlayerbotAI* botAI = BotAIFor(bot);
+    if (!botAI || !bot->IsAlive() || bot->IsInCombat() || !bot->IsFriendlyTo(other))
+        return "";
+    if (bot->GetMapId() != other->GetMapId() || other->IsInCombat())
+        return "";
+
+    if (resurrect)
+    {
+        if (other->IsAlive() || other->isResurrectRequested())
+            return "";
+
+        for (std::string const& name : ResurrectionsForClass(bot->getClass()))
+            if (CastableOn(bot, botAI, name, other))
+                return name;
+        return "";
+    }
+
+    if (!other->IsAlive() || other->GetHealth() >= other->GetMaxHealth())
+        return "";
+
+    for (std::string const& name : HealsForClass(bot->getClass()))
+        if (CastableOn(bot, botAI, name, other))
+            return name;
+
+    return "";
+}
+
 std::string DescribeActionMenu(const ActionMenu& menu, const std::string& otherName)
 {
     if (menu.Empty() && menu.goldRefusal.empty() && menu.alreadyHave.empty())
@@ -455,6 +595,8 @@ bool ValidateAction(const ActionMenu& menu, BotAction& action)
     switch (action.kind)
     {
         case ActionKind::None:
+        case ActionKind::Emote:
+        case ActionKind::Resurrect:
             return false;
 
         case ActionKind::Buff:
@@ -511,6 +653,21 @@ void SubmitBotAction(const BotAction& action)
 
     std::lock_guard<std::mutex> lock(g_PendingMutex);
     g_Pending.push_back(action);
+}
+
+void SubmitBotEmote(uint64_t botGuid, uint64_t targetGuid, uint32_t emoteId)
+{
+    if (botGuid == 0 || targetGuid == 0 || emoteId == 0)
+        return;
+
+    BotAction action;
+    action.kind = ActionKind::Emote;
+    action.botGuid = botGuid;
+    action.targetGuid = targetGuid;
+    action.emoteId = emoteId;
+
+    std::lock_guard<std::mutex> lock(g_PendingMutex);
+    g_Pending.push_back(std::move(action));
 }
 
 namespace
@@ -624,11 +781,22 @@ namespace
         {
             case ActionKind::Buff:
             case ActionKind::Heal:
+            case ActionKind::Resurrect:
             {
                 if (!bot->IsAlive() || bot->IsInCombat())
                     return Outcome::Abandoned;
                 if (bot->GetMapId() != target->GetMapId())
                     return Outcome::Abandoned;
+
+                if (action.kind == ActionKind::Resurrect)
+                {
+                    if (target->IsAlive() || target->isResurrectRequested())
+                        return Outcome::Abandoned;
+                }
+                else if (!target->IsAlive())
+                {
+                    return Outcome::Abandoned;
+                }
 
                 // CastSpell refuses while the bot is moving, and a following bot
                 // is always moving, so plant it before trying.

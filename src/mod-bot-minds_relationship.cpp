@@ -30,6 +30,7 @@ namespace
         std::string reason;
         uint32_t    interactionCount = 0;
         uint32_t    lastGiftAt = 0;
+        uint64_t    lastInteractionAt = 0;
     };
 
     struct PairHash
@@ -60,6 +61,7 @@ Relationship GetRelationship(uint64_t botGuid, uint64_t otherGuid)
     r.reason           = it->second.reason;
     r.interactionCount = it->second.interactionCount;
     r.lastGiftAt       = it->second.lastGiftAt;
+    r.lastInteractionAt = it->second.lastInteractionAt;
     return r;
 }
 
@@ -84,7 +86,10 @@ void ApplyRelationshipDelta(uint64_t botGuid, uint64_t otherGuid, bool otherIsBo
     row.affinity   = std::max(-1.0f, std::min(1.0f, row.affinity + affinityChange));
     if (!reason.empty())
         row.reason = reason;
-    ++row.interactionCount;
+    uint64_t const now = static_cast<uint64_t>(time(nullptr));
+    if (row.lastInteractionAt != now)
+        ++row.interactionCount;
+    row.lastInteractionAt = now;
 
     g_RelationshipDirty.insert(key);
 
@@ -94,6 +99,32 @@ void ApplyRelationshipDelta(uint64_t botGuid, uint64_t otherGuid, bool otherIsBo
                  "[BotMinds] Relationship bot {} -> {} affinity {:+.2f} => {:.2f} (reason '{}', count {})",
                  botGuid, otherGuid, affinityChange, row.affinity, row.reason, row.interactionCount);
     }
+}
+
+void RecordInteraction(uint64_t botGuid, uint64_t otherGuid, bool otherIsBot)
+{
+    if (botGuid == 0 || otherGuid == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_RelationshipMutex);
+
+    Key key(botGuid, otherGuid);
+    auto iterator = g_Relationships.find(key);
+    if (iterator == g_Relationships.end())
+    {
+        RelationshipRow row;
+        row.botGuid = botGuid;
+        row.otherGuid = otherGuid;
+        row.otherIsBot = otherIsBot;
+        iterator = g_Relationships.emplace(key, std::move(row)).first;
+    }
+
+    iterator->second.otherIsBot = otherIsBot;
+    uint64_t const now = static_cast<uint64_t>(time(nullptr));
+    if (iterator->second.lastInteractionAt != now)
+        ++iterator->second.interactionCount;
+    iterator->second.lastInteractionAt = now;
+    g_RelationshipDirty.insert(key);
 }
 
 void RecordGift(uint64_t botGuid, uint64_t otherGuid)
@@ -111,6 +142,7 @@ void RecordGift(uint64_t botGuid, uint64_t otherGuid)
     }
 
     it->second.lastGiftAt = static_cast<uint32_t>(time(nullptr));
+    it->second.lastInteractionAt = static_cast<uint64_t>(time(nullptr));
     g_RelationshipDirty.insert(key);
 }
 
@@ -122,7 +154,8 @@ void LoadRelationshipsFromDB()
 
     QueryResult result = CharacterDatabase.Query(
         "SELECT bot_guid, other_guid, other_is_bot, affinity, reason, interaction_count, "
-        "UNIX_TIMESTAMP(last_gift_at) FROM mod_bot_minds_relationship");
+        "UNIX_TIMESTAMP(last_gift_at), UNIX_TIMESTAMP(last_updated) "
+        "FROM mod_bot_minds_relationship");
 
     if (!result)
     {
@@ -142,6 +175,7 @@ void LoadRelationshipsFromDB()
         row.reason           = fields[4].IsNull() ? "" : fields[4].Get<std::string>();
         row.interactionCount = fields[5].Get<uint32_t>();
         row.lastGiftAt       = fields[6].IsNull() ? 0 : fields[6].Get<uint32_t>();
+        row.lastInteractionAt = fields[7].IsNull() ? 0 : fields[7].Get<uint64_t>();
 
         g_Relationships[Key(row.botGuid, row.otherGuid)] = std::move(row);
         ++count;
@@ -171,17 +205,20 @@ void FlushRelationshipsToDB()
         const std::string giftValue = row.lastGiftAt == 0
             ? "NULL"
             : SafeFormat("FROM_UNIXTIME({})", row.lastGiftAt);
+        const std::string interactionValue = row.lastInteractionAt == 0
+            ? "CURRENT_TIMESTAMP"
+            : SafeFormat("FROM_UNIXTIME({})", row.lastInteractionAt);
 
         CharacterDatabase.Execute(SafeFormat(
             "INSERT INTO mod_bot_minds_relationship "
-            "(bot_guid, other_guid, other_is_bot, affinity, reason, interaction_count, last_gift_at) "
-            "VALUES ({}, {}, {}, {:.3f}, '{}', {}, {}) "
+            "(bot_guid, other_guid, other_is_bot, affinity, reason, interaction_count, last_gift_at, last_updated) "
+            "VALUES ({}, {}, {}, {:.3f}, '{}', {}, {}, {}) "
             "ON DUPLICATE KEY UPDATE "
             "other_is_bot = VALUES(other_is_bot), affinity = VALUES(affinity), "
             "reason = VALUES(reason), interaction_count = VALUES(interaction_count), "
-            "last_gift_at = VALUES(last_gift_at)",
+            "last_gift_at = VALUES(last_gift_at), last_updated = VALUES(last_updated)",
             row.botGuid, row.otherGuid, row.otherIsBot ? 1 : 0,
-            row.affinity, escReason, row.interactionCount, giftValue));
+            row.affinity, escReason, row.interactionCount, giftValue, interactionValue));
     }
 
     if (g_DebugEnabled)

@@ -1,4 +1,5 @@
 #include "mod-bot-minds_attention.h"
+#include "mod-bot-minds_action.h"
 #include "mod-bot-minds_config.h"
 #include "mod-bot-minds_speak.h"
 
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <initializer_list>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -195,6 +197,68 @@ namespace
         return false;
     }
 
+    bool ContainsAnyWord(std::string const& text, std::initializer_list<char const*> words)
+    {
+        for (char const* word : words)
+            if (ContainsWord(text, word))
+                return true;
+        return false;
+    }
+
+    // Open requests should reach somebody who can actually help. The prompt will
+    // still decide what to say and the action layer validates what it chooses;
+    // this only avoids asking an incapable bystander while a suitable bot is
+    // standing beside them.
+    uint32_t CapabilityScore(Player* bot, Player* speaker, std::string const& loweredText)
+    {
+        bool const wantsBuff = ContainsAnyWord(loweredText,
+            {"buff", "buffs", "blessing", "fortitude", "intellect", "mark", "thorns"});
+        bool const wantsHeal = ContainsAnyWord(loweredText,
+            {"heal", "heals", "healing", "health", "hp"});
+        bool const wantsGold = ContainsAnyWord(loweredText,
+            {"gold", "silver", "copper", "money", "coin", "coins"});
+        bool const wantsOrder = ContainsAnyWord(loweredText,
+            {"follow", "stay", "wait"});
+
+        if (!wantsBuff && !wantsHeal && !wantsGold && !wantsOrder)
+            return 0;
+
+        ActionMenu const menu = BuildActionMenu(bot, speaker);
+        uint32_t score = 0;
+        if (wantsBuff && (!menu.buffs.empty() || !menu.refreshable.empty()))
+            ++score;
+        if (wantsHeal && !menu.heals.empty())
+            ++score;
+        if (wantsGold && menu.maxCopper > 0)
+            ++score;
+        if (wantsOrder && menu.canTakeOrders)
+            ++score;
+        return score;
+    }
+
+    Player* ChooseLocalResponder(std::vector<Player*> const& candidates, Player* speaker,
+                                 std::string const& loweredText, bool& capabilityMatched)
+    {
+        Player* best = nullptr;
+        uint32_t bestScore = 0;
+        float bestDistance = 0.0f;
+
+        for (Player* bot : candidates)
+        {
+            uint32_t const score = CapabilityScore(bot, speaker, loweredText);
+            float const distance = bot->GetDistance(speaker);
+            if (!best || score > bestScore || (score == bestScore && distance < bestDistance))
+            {
+                best = bot;
+                bestScore = score;
+                bestDistance = distance;
+            }
+        }
+
+        capabilityMatched = bestScore > 0;
+        return best;
+    }
+
     bool CanHear(Player* listener, Player* speaker, ChatScope scope, const std::string& channelName)
     {
         if (!listener || !speaker || listener == speaker || !listener->IsInWorld())
@@ -223,7 +287,7 @@ namespace
                 if (!manager)
                     return false;
                 Channel* channel = manager->GetChannel(channelName, listener);
-                return channel && listener->IsInChannel(channel);
+                return IsInChannelInstance(listener, channel);
             }
         }
 
@@ -268,7 +332,8 @@ namespace
 
     bool Dispatch(Player* bot, Player* other, TurnKind kind, const ScopeKey& key,
                   const std::string& trigger, const std::string& channelName,
-                  uint32_t chainDepth, bool forced, bool namedDirectly = false)
+                  uint32_t chainDepth, bool priority, bool replyRequired = false,
+                  bool namedDirectly = false)
     {
         TurnRequest request;
         request.bot         = bot;
@@ -279,8 +344,9 @@ namespace
         request.channelName = channelName;
         request.chainDepth    = chainDepth;
         request.namedDirectly = namedDirectly;
+        request.replyRequired = replyRequired;
 
-        return RequestBotTurn(request, forced);
+        return RequestBotTurn(request, priority);
     }
 }
 
@@ -296,7 +362,8 @@ void OnPlayerLine(Player* speaker, const std::string& text, ChatScope scope, con
     if (scope == ChatScope::Whisper)
     {
         if (whisperTarget && IsBot(whisperTarget))
-            Dispatch(whisperTarget, speaker, TurnKind::DirectReply, key, text, channelName, 0, true);
+            Dispatch(whisperTarget, speaker, TurnKind::DirectReply, key, text, channelName, 0,
+                     /*priority=*/true, /*replyRequired=*/true, /*namedDirectly=*/true);
         return;
     }
 
@@ -350,34 +417,68 @@ void OnPlayerLine(Player* speaker, const std::string& text, ChatScope scope, con
         if (g_DebugEnabled)
             LOG_INFO("server.loading", "[BotMinds] {} was named by {}{}; answering directly.",
                      mentioned->GetName(), speaker->GetName(), mentionedShort ? " (shortened)" : "");
-        Dispatch(mentioned, speaker, TurnKind::DirectReply, key, text, channelName, 0, true,
-                 /*namedDirectly=*/true);
+        Dispatch(mentioned, speaker, TurnKind::DirectReply, key, text, channelName, 0,
+                 /*priority=*/true, /*replyRequired=*/true, /*namedDirectly=*/true);
+        return;
+    }
+
+    // 2. Selecting a bot is the in-world equivalent of looking straight at it.
+    //    It wins over inferred floor ownership and proximity, but an explicit name
+    //    above still wins if the player names somebody else.
+    Player* selected = speaker->GetSelectedPlayer();
+    if (selected && IsBot(selected)
+        && std::find(candidates.begin(), candidates.end(), selected) != candidates.end())
+    {
+        if (g_DebugEnabled)
+        {
+            LOG_INFO("server.loading", "[BotMinds] {} selected {}; answering directly.",
+                     speaker->GetName(), selected->GetName());
+        }
+        Dispatch(selected, speaker, TurnKind::DirectReply, key, text, channelName, 0,
+                 /*priority=*/true, /*replyRequired=*/true, /*namedDirectly=*/true);
         return;
     }
 
     const bool broadcast = LooksLikeBroadcast(lowered);
 
-    // 2. Otherwise the bot you were already talking to owns the reply. Looked up
-    //    by GUID rather than searched for among the listeners: a bot that has
-    //    drifted a few yards out of say range mid-conversation still owes you an
-    //    answer, and dropping it here is what made follow-ups vanish.
+    // 3. In local chat, a greeting or room-wide question is normally aimed at
+    //    whoever is standing nearest. Pick one listener instead of making a lone
+    //    nearby bot pass both a chance roll and the ambient-chat pacing gates. If
+    //    the player asked for concrete help, prefer a bot that can provide it.
     Player* primary = nullptr;
-    if (!broadcast)
+    bool primaryReplyRequired = false;
+    bool localBroadcast = broadcast && scope == ChatScope::Say;
+    if (localBroadcast)
     {
+        bool capabilityMatched = false;
+        primary = ChooseLocalResponder(candidates, speaker, lowered, capabilityMatched);
+        primaryReplyRequired = true;
+
+        if (g_DebugEnabled && capabilityMatched)
+        {
+            LOG_INFO("server.loading", "[BotMinds] {} can help with {}'s local request.",
+                     primary->GetName(), speaker->GetName());
+        }
+    }
+    else if (!broadcast)
+    {
+        // Otherwise the bot you were already talking to owns the reply. Looked up
+        // by GUID rather than searched for among the listeners: a bot that has
+        // drifted a few yards out of say range mid-conversation still owes you an
+        // answer, and dropping it here is what made follow-ups vanish.
         FloorHolder floor = GetConversationFloor(key, speaker->GetGUID().GetRawValue());
         if (floor.guid != 0
             && (static_cast<uint32_t>(time(nullptr)) - floor.atSec) <= g_FloorWindowSec)
         {
             Player* holder = ObjectAccessor::FindPlayer(ObjectGuid(floor.guid));
 
-            // Overheard scopes still need the bot in talking distance, but it gets
-            // the wider conversational radius rather than strict say range, so a
-            // few yards of drift mid-exchange does not cost you the answer.
-            const bool closeEnough = (scope != ChatScope::Say && scope != ChatScope::Channel)
+            // Only /say is physically local. Numbered channels already require
+            // exact membership in CanHear; party and guild also span maps.
+            bool const closeEnough = scope != ChatScope::Say
                 || (holder && holder->IsWithinDistInMap(speaker, g_ProximityRadius));
 
             if (holder && IsBot(holder) && holder->IsInWorld() && !holder->IsBeingTeleported()
-                && holder->GetMapId() == speaker->GetMapId() && closeEnough
+                && closeEnough
                 && !(g_DisableRepliesInCombat && holder->IsInCombat()))
             {
                 primary = holder;
@@ -389,10 +490,13 @@ void OnPlayerLine(Player* speaker, const std::string& text, ChatScope scope, con
             }
         }
 
-        // 3. Small group with nobody holding the floor: someone still has to answer,
+        // 4. Small group with nobody holding the floor: someone still has to answer,
         //    otherwise a two-man party sits there ignoring you.
         if (!primary && candidates.size() <= g_SmallGroupSize)
+        {
             primary = candidates[urand(0, candidates.size() - 1)];
+            primaryReplyRequired = true;
+        }
     }
 
     uint32_t spoken = 0;
@@ -400,10 +504,21 @@ void OnPlayerLine(Player* speaker, const std::string& text, ChatScope scope, con
     if (primary)
     {
         if (g_DebugEnabled)
-            LOG_INFO("server.loading", "[BotMinds] {} holds the floor in {}; answering {}.",
-                     primary->GetName(), ScopeName(scope), speaker->GetName());
+        {
+            if (localBroadcast)
+            {
+                LOG_INFO("server.loading", "[BotMinds] {} picked up {}'s local broadcast.",
+                         primary->GetName(), speaker->GetName());
+            }
+            else
+            {
+                LOG_INFO("server.loading", "[BotMinds] {} holds the floor in {}; answering {}.",
+                         primary->GetName(), ScopeName(scope), speaker->GetName());
+            }
+        }
 
-        if (!Dispatch(primary, speaker, TurnKind::DirectReply, key, text, channelName, 0, true)
+        if (!Dispatch(primary, speaker, TurnKind::DirectReply, key, text, channelName, 0,
+                      /*priority=*/true, primaryReplyRequired)
             && g_DebugEnabled)
         {
             LOG_INFO("server.loading", "[BotMinds] {} owed {} an answer but was gated (combat, cap or no provider).",
@@ -418,14 +533,15 @@ void OnPlayerLine(Player* speaker, const std::string& text, ChatScope scope, con
                 continue;
             if (urand(0, 99) >= g_InterjectChance)
                 continue;
-            Dispatch(bot, speaker, TurnKind::Interjection, key, text, channelName, 0, false);
+            Dispatch(bot, speaker, TurnKind::Interjection, key, text, channelName, 0,
+                     /*priority=*/false);
             ++spoken;
         }
 
         return;
     }
 
-    // 4. Open floor: roll for each listener. A broadcast is fair game for several
+    // 5. Open floor: roll for each listener. A broadcast is fair game for several
     //    bots; anything else is offered as an interjection the bot can decline.
     const uint32_t chance = ChanceForScope(scope);
     const TurnKind kind   = broadcast ? TurnKind::DirectReply : TurnKind::Interjection;
@@ -438,8 +554,9 @@ void OnPlayerLine(Player* speaker, const std::string& text, ChatScope scope, con
             break;
         if (urand(0, 99) >= chance)
             continue;
-        Dispatch(bot, speaker, kind, key, text, channelName, 0, false);
-        ++spoken;
+        if (Dispatch(bot, speaker, kind, key, text, channelName, 0,
+                     /*priority=*/false, /*replyRequired=*/broadcast))
+            ++spoken;
     }
 
     if (g_DebugEnabled && spoken == 0)
@@ -476,7 +593,8 @@ void OnLineSpoken(uint64_t speakerGuid, const std::string& /*speakerName*/, cons
     {
         if (urand(0, 99) >= g_ReplyChanceBotToBot)
             continue;
-        Dispatch(bot, speaker, TurnKind::Interjection, key, text, channelName, chainDepth + 1, false);
+        Dispatch(bot, speaker, TurnKind::Interjection, key, text, channelName, chainDepth + 1,
+                 /*priority=*/false);
         break;   // at most one bot picks up another bot's line
     }
 }

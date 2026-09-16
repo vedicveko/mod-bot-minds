@@ -2,34 +2,27 @@
 #define MOD_BOT_MINDS_HTTPCLIENT_H
 
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
-// --------------------------------------------
-// Minimal HTTPS POST client over cpp-httplib, used to reach the LLM provider.
-// --------------------------------------------
+struct BotMindsHttpResult
+{
+    int status = 0;
+    std::string body;
+    std::string error;
+
+    bool Ok() const { return status >= 200 && status < 300 && error.empty(); }
+};
+
+// Minimal JSON HTTP client over cpp-httplib. Providers pass a complete URL so
+// local Ollama, Ollama Cloud, and future OpenAI-compatible endpoints all use the
+// same transport path.
 class BotMindsHttpClient
 {
 public:
-    BotMindsHttpClient();
-    ~BotMindsHttpClient();
-
-    // POST JSON to https://host/path with the given headers. Returns the response
-    // body, or "" on any failure or non-200 status.
-    //
-    // `outStatus` receives the HTTP status when there was a response at all, or 0
-    // when the request never completed. Callers use it to tell "the API rejected
-    // this" apart from "the network is down".
-    std::string PostSecure(const std::string& host,
-                           const std::string& path,
-                           const std::string& jsonData,
-                           const std::vector<std::pair<std::string, std::string>>& headers,
-                           int* outStatus = nullptr);
-
-    void SetTimeout(int seconds);
-
-private:
-    int m_timeout;
+    BotMindsHttpResult Post(std::string const& url, std::string const& jsonData,
+                            std::vector<std::pair<std::string, std::string>> const& headers,
+                            int timeoutSeconds, bool debug) const;
 };
 
 #endif // MOD_BOT_MINDS_HTTPCLIENT_H

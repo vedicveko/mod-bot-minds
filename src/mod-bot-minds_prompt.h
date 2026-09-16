@@ -19,7 +19,8 @@ enum class TurnKind : uint8_t
     DirectReply,   // addressed directly; answer it
     Interjection,  // someone else was addressed; speak only if it fits
     Ambient,       // unprompted remark about the bot's surroundings
-    Event          // reaction to something that just happened
+    Event,         // reaction to something that just happened
+    EmoteReaction  // a real player aimed a text emote at this bot
 };
 
 struct TurnRequest
@@ -31,7 +32,8 @@ struct TurnRequest
     std::string trigger;              // the message being answered, or the situation
     std::string channelName;          // only for ChatScope::Channel
     uint32_t    chainDepth = 0;       // bot-to-bot hops so far; 0 for anything a human started
-    bool        namedDirectly = false; // singled out by name, rather than picked to answer
+    bool        namedDirectly = false; // singled out by name or selection, rather than picked to answer
+    bool        replyRequired = false; // an explicit address/greeting deserves an answer; closers may not
 
     // What this bot can really do for `other` this turn. Filled by BuildTurnPrompt
     // and kept so the same menu validates whatever the model chooses.

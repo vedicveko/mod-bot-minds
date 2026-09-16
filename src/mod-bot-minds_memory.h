@@ -36,6 +36,10 @@ std::vector<MemoryEntry> GetRelevantMemories(uint64_t botGuid, uint64_t subjectG
 void AddMemory(uint64_t botGuid, uint64_t subjectGuid, const std::string& kind,
                const std::string& text, float salience);
 
+// Mark active memories about this quest as completed. This uses the existing
+// action_hint/action_state columns and leaves completed-adventure memories alone.
+void ResolveQuestMemories(uint64_t actorGuid, uint32_t questId, const std::string& questTitle);
+
 // Trim (bot, subject) down to g_MaxMemoriesPerSubject, dropping whatever scores
 // lowest and folding its gist into a summary row.
 void DistillOldMemories(uint64_t botGuid, uint64_t subjectGuid);

@@ -4,8 +4,8 @@
 #include "ScriptMgr.h"
 
 // --------------------------------------------
-// Unprompted chatter. Bots near a real player occasionally say something about
-// what is around them, through the same pipeline as everything else.
+// Unprompted life around real players: coordinated ambient chatter plus occasional
+// direct, capability-checked passerby buffs.
 // --------------------------------------------
 class BotMindsAmbientChatter : public WorldScript
 {

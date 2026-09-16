@@ -4,6 +4,7 @@
 #include "mod-bot-minds_transcript.h"
 
 #include <cstdint>
+#include <string>
 
 class Player;
 
@@ -18,14 +19,14 @@ class Player;
 // --------------------------------------------
 namespace BotMindsGovernor
 {
-    // `forced` marks a line the bot owes someone: a direct answer to a player who
-    // addressed it. Those skip the cooldown and the proximity check, but still
-    // respect the hard cap and the concurrency limit.
-    bool Allow(Player* bot, Player* addresser, ChatScope scope, bool forced);
+    // `priority` marks a turn addressed to this bot. It skips conversational
+    // cooldown and proximity gates, but still respects the hard cap and the
+    // concurrency limit. Whether the model must answer is a separate decision.
+    bool Allow(Player* bot, Player* addresser, ScopeKey const& key, bool priority);
 
-    // Call immediately after Allow passes: sets the bot's cooldown, ++in-flight,
-    // ++calls-this-interval.
-    void OnSubmit(uint64_t botGuid);
+    // Called by the dispatcher after a request is accepted: sets the bot's
+    // cooldown, ++in-flight, ++calls-this-interval.
+    void OnSubmit(uint64_t botGuid, ScopeKey const& key);
 
     // Call when a call completes, fails or is abandoned: --in-flight. Always pair
     // with OnSubmit.
@@ -38,6 +39,14 @@ namespace BotMindsGovernor
     // `.botminds status`. Every call costs money, so it should be countable.
     uint32_t CallsSinceStartup();
     int      CallsInFlight();
+
+    // Delivery-time repetition guard. A generated line is compared with recent
+    // lines from both this bot and this conversation scope before it is spoken.
+    bool IsRepetitive(uint64_t botGuid, ScopeKey const& key, std::string const& text);
+    void RecordUtterance(uint64_t botGuid, ScopeKey const& key, std::string const& text);
+
+    uint32_t RepetitionsBlocked();
+    uint32_t PacingBlocked();
 }
 
 #endif // MOD_BOT_MINDS_GOVERNOR_H

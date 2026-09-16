@@ -14,6 +14,7 @@ struct Relationship
     std::string reason;
     uint32_t    interactionCount = 0;
     uint32_t    lastGiftAt = 0;    // epoch seconds of the last gift, 0 == never
+    uint64_t    lastInteractionAt = 0; // epoch seconds, persisted in last_updated
 };
 
 // Return the relationship a bot has toward another actor. If none exists,
@@ -24,6 +25,10 @@ Relationship GetRelationship(uint64_t botGuid, uint64_t otherGuid);
 // set the reason, increment the interaction count, and upsert the row.
 void ApplyRelationshipDelta(uint64_t botGuid, uint64_t otherGuid, bool otherIsBot,
                             float affinityChange, const std::string& reason);
+
+// Record that these two actors just interacted even when the exchange did not
+// change affinity. Reunion behavior uses this persistent timestamp.
+void RecordInteraction(uint64_t botGuid, uint64_t otherGuid, bool otherIsBot);
 
 // Note that a bot has just given this person something, so the gift cooldown
 // survives a restart. Stored on the relationship because that is what it is: a

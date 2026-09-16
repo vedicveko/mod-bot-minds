@@ -17,7 +17,7 @@ namespace BotMindsEvents
     // `chance` is the roll for the event being worth commenting on at all.
     // A non-zero `guildId` sends the reaction to that guild's chat instead of to
     // whoever is standing nearby.
-    void Dispatch(Player* actor, const std::string& description, uint32_t chance, uint32 guildId = 0);
+    void Dispatch(Player* actor, std::string const& description, uint32_t chance, uint32 guildId = 0);
 }
 
 class ChatOnKill : public PlayerScript
@@ -73,12 +73,56 @@ public:
     void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override;
 };
 
+class ChatOnAchievement : public PlayerScript
+{
+public:
+    ChatOnAchievement();
+    void OnPlayerAchievementComplete(Player* player, AchievementEntry const* achievement) override;
+};
+
+class ChatOnGameObjectUse : public AllGameObjectScript
+{
+public:
+    ChatOnGameObjectUse();
+    bool CanGameObjectGossipHello(Player* player, GameObject* gameObject) override;
+};
+
 class ChatOnGuildChange : public GuildScript
 {
 public:
     ChatOnGuildChange();
     void OnAddMember(Guild* guild, Player* player, uint8& plRank) override;
     void OnRemoveMember(Guild* guild, Player* player, bool isDisbanding, bool isKicked) override;
+    void OnEvent(Guild* guild, uint8 eventType, ObjectGuid::LowType playerGuid1,
+                 ObjectGuid::LowType playerGuid2, uint8 newRank) override;
+};
+
+class ChatOnGuildLogin : public PlayerScript
+{
+public:
+    ChatOnGuildLogin();
+    void OnPlayerLogin(Player* player) override;
+};
+
+class ChatOnJourney : public PlayerScript
+{
+public:
+    ChatOnJourney();
+    void OnPlayerLogin(Player* player) override;
+    void OnPlayerBeforeLogout(Player* player) override;
+    void OnPlayerUpdateZone(Player* player, uint32 newZone, uint32 newArea) override;
+    void OnPlayerUpdateArea(Player* player, uint32 oldArea, uint32 newArea) override;
+    void OnPlayerMapChanged(Player* player) override;
+};
+
+class ChatOnGroupLife : public GroupScript
+{
+public:
+    ChatOnGroupLife();
+    void OnAddMember(Group* group, ObjectGuid guid) override;
+    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod method,
+                        ObjectGuid kicker, char const* reason) override;
+    void OnDisband(Group* group) override;
 };
 
 #endif // MOD_BOT_MINDS_EVENTS_H

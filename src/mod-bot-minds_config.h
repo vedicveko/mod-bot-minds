@@ -17,12 +17,16 @@ extern bool g_DebugShowFullPrompt;
 // --------------------------------------------
 // Provider
 // --------------------------------------------
-extern std::string g_CloudProvider;   // "anthropic" | "openai"
-extern std::string g_CloudApiKey;     // empty keeps every bot silent
+extern std::string g_CloudProvider;   // "anthropic" | "openai" | "ollama"
+extern std::string g_CloudApiKey;     // optional for local Ollama
+extern std::string g_ApiKeyEnv;       // optional environment variable containing the key
 extern std::string g_CloudModel;
+extern std::string g_ProviderUrl;      // used by providers with configurable endpoints
 extern uint32_t    g_CloudMaxTokens;
 extern uint32_t    g_CloudTimeoutSec;
 extern uint32_t    g_MaxReplyChars;
+extern bool        g_StripMarkdown;
+extern bool        g_StripDecorativeUnicode;
 
 // --------------------------------------------
 // Routing: which channels bots listen to
@@ -70,7 +74,16 @@ extern uint32_t g_MaxMemoryPromptChars;
 extern float    g_ProximityRadius;
 extern uint32_t g_PerBotCooldownSec;
 extern uint32_t g_MaxConcurrentCalls;
+extern uint32_t g_DispatchWorkerThreads;
+extern uint32_t g_MaxQueueDepth;
 extern uint32_t g_MaxCallsPerMinute;
+extern uint32_t g_PerScopeCooldownSec;
+extern uint32_t g_MaxCallsPerScopePerMinute;
+extern uint32_t g_BotHistorySize;
+extern uint32_t g_ScopeHistorySize;
+extern float    g_RepetitionSimilarityThreshold;
+extern uint32_t g_RepetitionWindowSec;
+extern uint32_t g_OpenerHistorySize;
 extern bool     g_DisableRepliesInCombat;
 
 // --------------------------------------------
@@ -80,6 +93,10 @@ extern bool     g_EnableAmbientChatter;
 extern uint32_t g_AmbientChance;
 extern uint32_t g_AmbientMinIntervalSec;
 extern uint32_t g_AmbientMaxIntervalSec;
+extern bool     g_AmbientUseGeneralChannel;
+extern bool     g_AmbientUseTradeChannel;
+extern bool     g_AmbientUseLfgChannel;
+extern bool     g_AmbientUseGuildRecruitmentChannel;
 
 // --------------------------------------------
 // Event chatter
@@ -96,10 +113,41 @@ extern uint32_t g_EventChanceQuest;
 extern uint32_t g_EventChanceSpell;
 extern uint32_t g_EventChanceDuel;
 extern uint32_t g_EventChanceLevelUp;
+extern uint32_t g_EventChanceAchievement;
+extern uint32_t g_EventChanceObjectUse;
 extern uint32_t g_EventChanceGuildEpic;
 extern uint32_t g_EventChanceGuildRare;
 extern uint32_t g_EventChanceGuildLevelUp;
 extern uint32_t g_EventChanceGuildMember;
+extern uint32_t g_EventChanceGuildLogin;
+extern uint32_t g_EventChanceGuildPromotion;
+extern uint32_t g_EventChanceGuildDemotion;
+extern uint32_t g_EventChanceGuildAchievement;
+extern uint32_t g_EventChanceDungeonComplete;
+
+// --------------------------------------------
+// World life: shared journeys, reunions and quiet physical reactions
+// --------------------------------------------
+extern bool     g_WorldLifeEnable;
+extern uint32_t g_JourneyZoneChance;
+extern uint32_t g_JourneyTownChance;
+extern uint32_t g_JourneyDungeonChance;
+extern uint32_t g_JourneyBossChance;
+extern uint32_t g_JourneyCooldownSec;
+extern uint32_t g_ReunionChance;
+extern uint32_t g_ReunionMinAbsenceSec;
+extern float    g_SharedExperienceAffinity;
+extern uint32_t g_IdleGestureChance;
+
+// --------------------------------------------
+// Reactions to player text emotes aimed at a bot
+// --------------------------------------------
+extern bool     g_EnableEmoteReactions;
+extern uint32_t g_EmoteReactionChance;
+extern uint32_t g_EmoteReactionMirrorWeight;
+extern uint32_t g_EmoteReactionCounterWeight;
+extern uint32_t g_EmoteReactionSpeakWeight;
+extern uint32_t g_EmoteReactionCooldownSec;
 
 // --------------------------------------------
 // Actions: what bots will actually do, not just say
@@ -116,11 +164,31 @@ extern uint32_t g_ConversationHoldSec;  // how long a bot stands still after spe
 extern uint32_t g_EmoteCooldownSec;     // least time between one bot's gestures; 0 disables them
 
 // --------------------------------------------
+// Helpful recovery: unsolicited resurrection and post-combat healing
+// --------------------------------------------
+extern bool     g_RecoveryEnable;
+extern uint32_t g_RecoveryScanIntervalSec;
+extern float    g_RecoveryDistance;
+extern uint32_t g_RecoveryResurrectChance;
+extern uint32_t g_RecoveryHealChance;
+extern uint32_t g_RecoveryHealBelowPct;
+extern uint32_t g_RecoveryCooldownSec;
+
+// --------------------------------------------
+// Reciprocity: acknowledge real players who help bots
+// --------------------------------------------
+extern bool     g_ReciprocityEnable;
+extern float    g_ReciprocityAffinityGain;
+extern uint32_t g_ReciprocityCooldownSec;
+extern uint32_t g_ReciprocitySpeakChance;
+
+// --------------------------------------------
 // Presentation
 // --------------------------------------------
 extern bool     g_EnableTypingSimulation;
 extern uint32_t g_TypingSimulationBaseDelay;
 extern uint32_t g_TypingSimulationDelayPerChar;
+extern uint32_t g_TypingSimulationMaxDelay;
 
 // --------------------------------------------
 // Playerbot commands typed in chat, which are instructions rather than talk.

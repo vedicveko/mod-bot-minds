@@ -7,7 +7,7 @@
 # restarts, and one pipeline for every line they say (replies, idle chatter and
 # reactions to what happens around them).
 #
-# Needs an API key. Bots stay silent without one.
+# Hosted providers need an API key. A local Ollama endpoint does not.
 ########################################
 
 # BotMinds.Enable
@@ -30,24 +30,40 @@ BotMinds.DebugShowFullPrompt = 0
 ########################################
 
 # BotMinds.Provider
-#     Description: "anthropic" or "openai". Both need tool calling, which the
-#                  memory system depends on.
+#     Description: "anthropic", "openai" or "ollama". All need tool calling,
+#                  which the memory and action systems depend on.
 #
 #                  Anthropic is the tested path. The OpenAI provider is wired up
 #                  but has never had a call made through it; if you select it and
 #                  bots stay silent, the server log will carry the API's own
-#                  error text. Reports welcome.
+#                  error text. Ollama supports both a local server and direct
+#                  Ollama Cloud access through BotMinds.Url.
 #     Default:     "anthropic"
 BotMinds.Provider = "anthropic"
 
 # BotMinds.ApiKey
-#     Description: API key for the provider. Empty keeps every bot silent.
+#     Description: API key for the provider. May be empty for local Ollama or
+#                  when BotMinds.ApiKeyEnv names an environment variable.
 #     Default:     ""
 BotMinds.ApiKey = ""
+
+# BotMinds.ApiKeyEnv
+#     Description: Optional environment variable containing the provider API
+#                  key. Useful for keeping hosted-provider secrets out of this
+#                  file. For direct Ollama Cloud access, use "OLLAMA_API_KEY".
+#     Default:     ""
+BotMinds.ApiKeyEnv = ""
 
 # BotMinds.Model
 #     Default:     "claude-haiku-4-5"
 BotMinds.Model = "claude-haiku-4-5"
+
+# BotMinds.Url
+#     Description: Ollama chat endpoint. Ignored by Anthropic and OpenAI.
+#                  Local:  http://localhost:11434/api/chat
+#                  Cloud:  https://ollama.com/api/chat
+#     Default:     "http://localhost:11434/api/chat"
+BotMinds.Url = "http://localhost:11434/api/chat"
 
 # BotMinds.MaxTokens
 #     Default:     512
@@ -62,6 +78,27 @@ BotMinds.TimeoutSec = 30
 #                  anything longer is trimmed back to a sentence or word boundary.
 #     Default:     200
 BotMinds.MaxReplyChars = 200
+
+# BotMinds.Response.StripMarkdown
+# BotMinds.Response.StripDecorativeUnicode
+#     Description: Remove formatting, emoji and other decoration that does not
+#                  render naturally in the 3.3.5 chat client. Smart punctuation
+#                  is folded to ASCII and accented Latin letters are preserved.
+#     Default:     1
+BotMinds.Response.StripMarkdown = 1
+BotMinds.Response.StripDecorativeUnicode = 1
+
+# BotMinds.WorkerThreads
+#     Description: Managed HTTP workers. Keep this at least as large as
+#                  Limits.MaxConcurrentCalls. Changes take effect after restart.
+#     Default:     3
+BotMinds.WorkerThreads = 3
+
+# BotMinds.MaxQueueDepth
+#     Description: Maximum requests waiting for a worker. 0 is unlimited.
+#                  Completed replies waiting for a typing delay are separate.
+#     Default:     64
+BotMinds.MaxQueueDepth = 64
 
 ########################################
 # Which channels bots listen to
@@ -183,6 +220,19 @@ BotMinds.Limits.ProximityRadius = 40.0
 #     Default:     12
 BotMinds.Limits.PerBotCooldownSec = 12
 
+# BotMinds.Limits.PerScopeCooldownSec
+#     Description: Quiet time between unprompted lines in one conversation scope
+#                  (local listener, party, guild or channel). Direct answers
+#                  ignore it.
+#     Default:     15
+BotMinds.Limits.PerScopeCooldownSec = 15
+
+# BotMinds.Limits.MaxCallsPerScopePerMinute
+#     Description: Maximum unprompted calls in one conversation scope per minute.
+#                  Direct answers ignore it. 0 disables this limit.
+#     Default:     8
+BotMinds.Limits.MaxCallsPerScopePerMinute = 8
+
 # BotMinds.Limits.MaxConcurrentCalls
 #     Description: How many API calls may be in flight at once. Anything asked to
 #                  speak while the slots are full stays quiet.
@@ -201,10 +251,29 @@ BotMinds.Limits.MaxCallsPerMinute = 60
 BotMinds.Limits.DisableRepliesInCombat = 1
 
 ########################################
+# Repetition protection
+########################################
+
+# Recent lines are compared by content words and character trigrams. The scope
+# history also rejects repeated three-word openers, which stops a room full of
+# different bots all beginning with the same catchphrase. Set both history sizes
+# to 0 to disable this guard.
+BotMinds.Repetition.BotHistorySize = 12
+BotMinds.Repetition.ScopeHistorySize = 30
+BotMinds.Repetition.SimilarityThreshold = 0.72
+BotMinds.Repetition.WindowSec = 1800
+BotMinds.Repetition.OpenerHistorySize = 8
+
+########################################
 # Ambient chatter
 #
 # Unprompted remarks about whatever is around the bot, only where a real player
-# can hear them.
+# can hear them. Timing is coordinated per audible scene, so adding more bots to
+# an inn, party or channel adds possible speakers without multiplying the chatter
+# rate. A failed chance roll retries on the next 30-second coordinator tick; a
+# successful line starts the full random interval. When combat replies are
+# disabled and every possible speaker is fighting, the interval pauses and
+# resumes with its remaining time after combat.
 ########################################
 
 # Who a bot needs nearby before it speaks unprompted is BotMinds.SayDistance,
@@ -215,6 +284,16 @@ BotMinds.Ambient.Enable         = 1
 BotMinds.Ambient.Chance         = 25
 BotMinds.Ambient.MinIntervalSec = 120
 BotMinds.Ambient.MaxIntervalSec = 600
+
+# Ambient numbered-channel destinations. Party chat still takes priority when a
+# real player is grouped with the bot. Otherwise Say and every enabled channel
+# that both a bot and a real player have joined are eligible destinations.
+# Numbered channels are off by default because their audience and call volume can
+# be much larger than local Say.
+BotMinds.Ambient.Channel.General = 0
+BotMinds.Ambient.Channel.Trade = 0
+BotMinds.Ambient.Channel.LookingForGroup = 0
+BotMinds.Ambient.Channel.GuildRecruitment = 0
 
 ########################################
 # Event reactions
@@ -238,6 +317,8 @@ BotMinds.Events.Chance.Quest   = 20
 BotMinds.Events.Chance.Spell   = 2
 BotMinds.Events.Chance.Duel    = 25
 BotMinds.Events.Chance.LevelUp = 60
+BotMinds.Events.Chance.Achievement = 75
+BotMinds.Events.Chance.ObjectUse = 10
 
 # BotMinds.Events.Chance.Loot
 #     Description: Only rare quality and above is ever considered.
@@ -248,6 +329,56 @@ BotMinds.Events.Chance.GuildEpicGear = 80
 BotMinds.Events.Chance.GuildRareGear = 30
 BotMinds.Events.Chance.GuildLevelUp  = 50
 BotMinds.Events.Chance.GuildMember   = 60
+BotMinds.Events.Chance.GuildLogin = 60
+BotMinds.Events.Chance.GuildPromotion = 25
+BotMinds.Events.Chance.GuildDemotion = 5
+BotMinds.Events.Chance.GuildAchievement = 75
+BotMinds.Events.Chance.DungeonComplete = 85
+
+########################################
+# World life
+#
+# Party bots notice changes in the shared journey, recognize people they know,
+# build history with one another and sometimes use an ordinary gesture instead
+# of spending a provider call on another line. Journey events are coordinated
+# per party, so only one bot reacts.
+########################################
+
+BotMinds.WorldLife.Enable = 1
+BotMinds.WorldLife.Chance.Zone = 35
+BotMinds.WorldLife.Chance.Town = 45
+BotMinds.WorldLife.Chance.Dungeon = 75
+BotMinds.WorldLife.Chance.Boss = 90
+
+# Suppresses a second travel remark when a map, zone and town transition happen
+# together. It does not affect boss, quest or ordinary ambient reactions.
+BotMinds.WorldLife.JourneyCooldownSec = 120
+
+# A bot only greets somebody as a returning acquaintance when it has a stored
+# relationship and that relationship has not been touched for this long.
+BotMinds.WorldLife.Reunion.Chance = 70
+BotMinds.WorldLife.Reunion.MinAbsenceSec = 21600
+
+# Small mutual affinity gain between bots after meaningful shared successes.
+# 0 keeps bot-to-bot relationships entirely model-driven.
+BotMinds.WorldLife.SharedExperienceAffinity = 0.01
+
+# Chance that a due ambient scene becomes a context-appropriate gesture rather
+# than an LLM line. This uses the normal ambient interval and emote cooldown.
+BotMinds.WorldLife.IdleGestureChance = 20
+
+########################################
+# Player emote reactions
+########################################
+
+# A real player must target the bot with a text emote. Mirror and counter
+# reactions are normal in-game emotes and do not call the provider; Speak does.
+BotMinds.EmoteReaction.Enable = 1
+BotMinds.EmoteReaction.Chance = 60
+BotMinds.EmoteReaction.MirrorWeight = 55
+BotMinds.EmoteReaction.CounterWeight = 30
+BotMinds.EmoteReaction.SpeakWeight = 15
+BotMinds.EmoteReaction.CooldownSec = 20
 
 ########################################
 # Actions
@@ -298,21 +429,101 @@ BotMinds.Actions.Gold.CopperPerLevel = 100
 BotMinds.Actions.Gold.CooldownSec = 86400
 
 # BotMinds.Actions.Unprompted.Chance
-#     Description: Chance that an idle chatter turn becomes a good turn instead of
-#                  a remark, when there is somebody nearby to do it for.
+#     Description: Chance every 30 seconds that a nearby capable bot casts one
+#                  genuinely missing buff on a real player. The cast is direct and
+#                  does not spend an LLM request. Choices are class- and
+#                  context-aware: useful long buffs win, mutually exclusive
+#                  blessings are respected, and aquatic/emergency spells are only
+#                  used when relevant. 0 disables passerby buffs.
 #     Default:     20
 BotMinds.Actions.Unprompted.Chance = 20
 
 # BotMinds.Actions.Unprompted.CooldownSec
-#     Description: How long before anyone does you another unasked favour, so it
-#                  stays a nice surprise.
+#     Description: How long before anyone gives the same real player another
+#                  unasked buff, so it stays a nice surprise.
 #     Default:     900
 BotMinds.Actions.Unprompted.CooldownSec = 900
 
+########################################
+# Helpful recovery
+########################################
+
+# A nearby friendly healer bot may resurrect a dead real player or heal a badly
+# hurt one after combat. These casts are direct and use no LLM request. Existing
+# resurrection offers, battlegrounds and anyone still fighting are left alone.
+
+# BotMinds.Recovery.Enable
+#     Default:     1
+BotMinds.Recovery.Enable = 1
+
+# BotMinds.Recovery.ScanIntervalSec
+#     Description: How often nearby real players are checked. This timer is
+#                  independent of ambient chatter and passerby buffs.
+#     Default:     10
+BotMinds.Recovery.ScanIntervalSec = 10
+
+# BotMinds.Recovery.Distance
+#     Description: Furthest distance in yards from healer to player.
+#     Default:     30.0
+BotMinds.Recovery.Distance = 30.0
+
+# BotMinds.Recovery.ResurrectChance
+#     Description: Chance on each scan that an eligible dead player receives a
+#                  resurrection offer. 0 disables spontaneous resurrection.
+#     Default:     75
+BotMinds.Recovery.ResurrectChance = 75
+
+# BotMinds.Recovery.HealChance
+#     Description: Chance on each scan that an eligible badly hurt player is
+#                  healed. 0 disables spontaneous post-combat healing.
+#     Default:     35
+BotMinds.Recovery.HealChance = 35
+
+# BotMinds.Recovery.HealBelowPct
+#     Description: A living player must be below this health percentage.
+#     Default:     55
+BotMinds.Recovery.HealBelowPct = 55
+
+# BotMinds.Recovery.CooldownSec
+#     Description: Quiet time after somebody receives either kind of recovery.
+#     Default:     300
+BotMinds.Recovery.CooldownSec = 300
+
+########################################
+# Social reciprocity
+########################################
+
+# A bot notices an effective heal, direct positive spell or completed
+# resurrection from a real player. It remembers the help in its relationship,
+# waits until combat is over, then /thanks and may add one short line. A group
+# buff produces at most one visible response at a time instead of a chorus.
+
+# BotMinds.Reciprocity.Enable
+#     Default:     1
+BotMinds.Reciprocity.Enable = 1
+
+# BotMinds.Reciprocity.AffinityGain
+#     Description: Relationship increase for one credited act of help.
+#     Default:     0.02
+BotMinds.Reciprocity.AffinityGain = 0.02
+
+# BotMinds.Reciprocity.CooldownSec
+#     Description: How often the same bot credits the same player. This also
+#                  prevents healing-over-time ticks from producing repeated thanks.
+#     Default:     300
+BotMinds.Reciprocity.CooldownSec = 300
+
+# BotMinds.Reciprocity.SpeakChance
+#     Description: Chance that /thank also gets a short local line. No provider
+#                  call is made. 0 leaves the normal text emote only.
+#     Default:     35
+BotMinds.Reciprocity.SpeakChance = 35
+
 # BotMinds.Conversation.HoldStillSec
-#     Description: How long a bot stands still and faces you after speaking to
-#                  you, in seconds. Each new line refreshes it, so a conversation
-#                  keeps them planted until it goes quiet.
+#     Description: How long a bot stands still and faces you after accepting a
+#                  direct local turn, in seconds. The hold begins while the reply
+#                  is generated and refreshes when it is spoken, so a conversation
+#                  keeps the bot planted until it goes quiet.
 #
 #                  A real player stops walking to type. Without this a bot answers
 #                  you and jogs off mid-sentence, and you end up chasing it to stay
@@ -342,6 +553,7 @@ BotMinds.Emote.CooldownSec = 180
 BotMinds.Typing.Enable         = 0
 BotMinds.Typing.BaseDelayMs    = 1000
 BotMinds.Typing.DelayPerCharMs = 25
+BotMinds.Typing.MaxDelayMs     = 8000
 
 ########################################
 # Housekeeping

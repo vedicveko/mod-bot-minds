@@ -2,6 +2,7 @@
 #include "mod-bot-minds_action.h"
 #include "mod-bot-minds_attention.h"
 #include "mod-bot-minds_config.h"
+#include "mod-bot-minds_dispatch.h"
 #include "mod-bot-minds_governor.h"
 #include "mod-bot-minds_llmclient.h"
 #include "mod-bot-minds_memory.h"
@@ -17,29 +18,75 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 
+#include <algorithm>
 #include <cctype>
-#include <chrono>
+#include <limits>
 #include <string>
-#include <thread>
+#include <utility>
+#include <vector>
 
 namespace
 {
-    // Strip a leading "Name:" the model sometimes prepends despite the rules.
-    void StripNamePrefix(std::string& reply, const std::string& name)
+    struct BotTurnContext
     {
-        if (reply.size() <= name.size() + 1)
-            return;
-        if (reply.compare(0, name.size(), name) != 0 || reply[name.size()] != ':')
-            return;
+        uint64_t botGuid = 0;
+        uint64_t otherGuid = 0;
+        bool otherIsBot = false;
+        bool namedDirectly = false;
+        bool replyRequired = false;
+        std::string botName;
+        std::string whisperTarget;
+        ScopeKey key;
+        std::string channelName;
+        uint32_t chainDepth = 0;
+        TurnKind kind = TurnKind::DirectReply;
+        ActionMenu menu;
+    };
 
-        reply = reply.substr(name.size() + 1);
-        size_t start = reply.find_first_not_of(' ');
-        reply = (start == std::string::npos) ? "" : reply.substr(start);
+    void StripNamePrefix(std::string& reply, std::string const& name)
+    {
+        auto equalIgnoringCase = [](std::string const& left, std::string const& right)
+        {
+            if (left.size() != right.size())
+                return false;
+            for (size_t index = 0; index < left.size(); ++index)
+            {
+                if (std::tolower(static_cast<unsigned char>(left[index]))
+                    != std::tolower(static_cast<unsigned char>(right[index])))
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (reply.size() >= 3 && (reply.front() == '<' || reply.front() == '['))
+        {
+            char const closer = reply.front() == '<' ? '>' : ']';
+            size_t const end = reply.find(closer);
+            if (end != std::string::npos && equalIgnoringCase(reply.substr(1, end - 1), name))
+            {
+                size_t marker = end + 1;
+                while (marker < reply.size() && reply[marker] == ' ')
+                    ++marker;
+                if (marker < reply.size() && (reply[marker] == ':' || reply[marker] == '-'))
+                    ++marker;
+                reply.erase(0, marker);
+            }
+        }
+        else if (reply.size() > name.size() && equalIgnoringCase(reply.substr(0, name.size()), name))
+        {
+            size_t marker = name.size();
+            while (marker < reply.size() && reply[marker] == ' ')
+                ++marker;
+            if (marker < reply.size() && (reply[marker] == ':' || reply[marker] == '-'))
+                reply.erase(0, marker + 1);
+        }
+
+        size_t const start = reply.find_first_not_of(' ');
+        reply = start == std::string::npos ? "" : reply.substr(start);
     }
 
-    // Only speak out loud where a person can actually hear it. Bots talking to an
-    // empty field costs calls and fills the say transcript with lines the player
-    // never heard.
     bool RealPlayerWithinSayRange(Player* bot)
     {
         for (auto const& pair : ObjectAccessor::GetPlayers())
@@ -55,9 +102,8 @@ namespace
         return false;
     }
 
-    // Put the line in the right channel. Returns false if it could not be spoken.
-    bool SpeakInScope(Player* bot, PlayerbotAI* botAI, const std::string& reply,
-                      ChatScope scope, const std::string& channelName, const std::string& whisperTarget)
+    bool SpeakInScope(Player* bot, PlayerbotAI* botAI, std::string const& reply,
+                      ChatScope scope, std::string const& channelName, std::string const& whisperTarget)
     {
         switch (scope)
         {
@@ -66,7 +112,6 @@ namespace
                     return false;
                 botAI->Say(reply);
                 return true;
-
             case ChatScope::Party:
                 if (!bot->GetGroup())
                     return false;
@@ -75,30 +120,24 @@ namespace
                 else
                     botAI->SayToParty(reply);
                 return true;
-
             case ChatScope::Guild:
                 if (!bot->GetGuild())
                     return false;
                 botAI->SayToGuild(reply);
                 return true;
-
             case ChatScope::Whisper:
                 if (whisperTarget.empty())
                     return false;
                 botAI->Whisper(reply, whisperTarget);
                 return true;
-
             case ChatScope::Channel:
             {
-                if (channelName.find("General") != std::string::npos)
-                    return botAI->SayToChannel(reply, ChatChannelId::GENERAL);
-
                 ChannelMgr* manager = ChannelMgr::forTeam(bot->GetTeamId());
                 if (!manager)
                     return false;
 
                 Channel* channel = manager->GetChannel(channelName, bot);
-                if (!channel || !bot->IsInChannel(channel))
+                if (!IsInChannelInstance(bot, channel))
                     return false;
 
                 channel->Say(bot->GetGUID(), reply, LANG_UNIVERSAL);
@@ -109,248 +148,284 @@ namespace
         return false;
     }
 
-    // Releases the governor's concurrency slot exactly once, however the turn ends.
-    struct SlotGuard
+    void CompleteBotTurn(BotTurnContext const& context, LLMResult result)
     {
-        ~SlotGuard() { BotMindsGovernor::OnComplete(); }
-    };
+        bool const declined = !result.shouldReply && !context.replyRequired;
+        if (!result.ok || declined || result.reply.empty())
+        {
+            if (g_DebugEnabled)
+            {
+                std::string const reason = !result.ok
+                    ? (result.error.empty() ? "no usable response" : result.error)
+                    : "chose not to reply";
+                LOG_INFO("server.loading", "[BotMinds] {} stayed silent ({}).", context.botName, reason);
+            }
+            return;
+        }
+
+        StripNamePrefix(result.reply, context.botName);
+        if (result.reply.empty())
+            return;
+
+        if (BotMindsGovernor::IsRepetitive(context.botGuid, context.key, result.reply))
+        {
+            if (g_DebugEnabled)
+            {
+                LOG_INFO("server.loading", "[BotMinds] {} repeated a recent line; reply dropped.",
+                         context.botName);
+            }
+            return;
+        }
+
+        Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(context.botGuid));
+        if (!bot || !bot->IsInWorld())
+            return;
+
+        PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
+        if (!botAI)
+            return;
+
+        if (!SpeakInScope(bot, botAI, result.reply, context.key.scope,
+                          context.channelName, context.whisperTarget))
+        {
+            if (g_DebugEnabled)
+            {
+                LOG_INFO("server.loading", "[BotMinds] {} could not speak in {}; line dropped.",
+                         context.botName, ScopeName(context.key.scope));
+            }
+            return;
+        }
+
+        if (g_DebugEnabled)
+        {
+            LOG_INFO("server.loading", "[BotMinds] {} ({} in {}): {}", context.botName,
+                     static_cast<int>(context.kind), ScopeName(context.key.scope), result.reply);
+        }
+
+        if (!context.otherIsBot && context.otherGuid != 0 && !bot->IsInCombat()
+            && !(bot->GetGroup() && bot->GetGroup()->IsMember(ObjectGuid(context.otherGuid))))
+        {
+            HoldStillForConversation(context.botGuid, context.otherGuid);
+        }
+
+        RecordChatLine(context.key, context.botGuid, context.botName, result.reply);
+        BotMindsGovernor::RecordUtterance(context.botGuid, context.key, result.reply);
+
+        if (context.otherGuid != 0)
+            RecordInteraction(context.botGuid, context.otherGuid, context.otherIsBot);
+
+        if (!context.otherIsBot && context.otherGuid != 0
+            && (context.kind == TurnKind::DirectReply || context.kind == TurnKind::Interjection
+                || context.kind == TurnKind::EmoteReaction))
+        {
+            SetConversationFloor(context.key, context.otherGuid, context.botGuid);
+        }
+
+        std::vector<PendingMemory> memories;
+        if (context.kind != TurnKind::Ambient && result.memory_additions.is_array())
+        {
+            for (auto const& entry : result.memory_additions)
+            {
+                if (!entry.is_object() || !entry.contains("text") || !entry["text"].is_string())
+                    continue;
+
+                std::string text = entry["text"].get<std::string>();
+                if (text.empty())
+                    continue;
+
+                PendingMemory memory;
+                memory.kind = entry.contains("kind") && entry["kind"].is_string()
+                    ? entry["kind"].get<std::string>() : "event";
+                memory.text = std::move(text);
+                memory.salience = entry.contains("salience") && entry["salience"].is_number()
+                    ? entry["salience"].get<float>() : 0.5f;
+                memories.push_back(std::move(memory));
+            }
+        }
+
+        if (g_DebugEnabled && context.kind != TurnKind::Ambient && memories.empty())
+            LOG_INFO("server.loading", "[BotMinds] {} came back with nothing to remember.", context.botName);
+
+        bool const hasRelationshipChange = context.otherGuid != 0
+            && result.relationship_delta.is_object()
+            && result.relationship_delta.contains("affinity_change")
+            && result.relationship_delta["affinity_change"].is_number();
+        float const affinityChange = hasRelationshipChange
+            ? result.relationship_delta["affinity_change"].get<float>() : 0.0f;
+        std::string const affinityReason = hasRelationshipChange
+            && result.relationship_delta.contains("reason") && result.relationship_delta["reason"].is_string()
+            ? result.relationship_delta["reason"].get<std::string>() : std::string();
+
+        if (!result.emote.empty() && !context.otherIsBot && context.otherGuid != 0)
+        {
+            if (uint32_t const emoteId = ResolveEmote(context.botGuid, result.emote))
+            {
+                BotAction gesture;
+                gesture.kind = ActionKind::Emote;
+                gesture.botGuid = context.botGuid;
+                gesture.targetGuid = context.otherGuid;
+                gesture.emoteId = emoteId;
+                SubmitBotAction(gesture);
+            }
+        }
+
+        bool committed = false;
+        if (result.action.is_object())
+        {
+            BotAction action;
+            action.botGuid = context.botGuid;
+            action.targetGuid = context.otherGuid;
+            std::string const actionKind = result.action.contains("kind") && result.action["kind"].is_string()
+                ? result.action["kind"].get<std::string>() : "none";
+            action.kind = ActionKindFromName(actionKind);
+            if (result.action.contains("spell") && result.action["spell"].is_string())
+                action.spellName = result.action["spell"].get<std::string>();
+            if (result.action.contains("copper") && result.action["copper"].is_number_unsigned())
+            {
+                uint64_t const copper = result.action["copper"].get<uint64_t>();
+                action.copper = static_cast<uint32_t>(std::min<uint64_t>(
+                    copper, std::numeric_limits<uint32_t>::max()));
+            }
+            else if (result.action.contains("copper") && result.action["copper"].is_number_integer())
+            {
+                int64_t const copper = result.action["copper"].get<int64_t>();
+                if (copper > 0)
+                {
+                    action.copper = static_cast<uint32_t>(std::min<uint64_t>(
+                        static_cast<uint64_t>(copper), std::numeric_limits<uint32_t>::max()));
+                }
+            }
+            action.promised = context.kind == TurnKind::DirectReply || context.kind == TurnKind::Interjection;
+
+            std::string lowered = result.reply;
+            for (char& character : lowered)
+                character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+
+            for (char const* hint : {"mail", "post", "inbox", "sent it", "send it"})
+            {
+                if (lowered.find(hint) != std::string::npos)
+                {
+                    action.mentionedPost = true;
+                    break;
+                }
+            }
+
+            action.wholeGroup = !context.namedDirectly
+                && context.key.scope == ChatScope::Party
+                && (action.kind == ActionKind::Follow || action.kind == ActionKind::Stay);
+
+            if (action.kind != ActionKind::None && ValidateAction(context.menu, action))
+            {
+                action.memories = std::move(memories);
+                action.otherIsBot = context.otherIsBot;
+                action.hasRelationshipChange = hasRelationshipChange;
+                action.affinityChange = affinityChange;
+                action.affinityReason = affinityReason;
+
+                SubmitBotAction(action);
+                memories.clear();
+                committed = true;
+            }
+            else if (g_DebugEnabled && action.kind != ActionKind::None)
+            {
+                LOG_INFO("server.loading",
+                         "[BotMinds] Dropped an action {} tried to take that was not on offer.",
+                         context.botName);
+            }
+        }
+
+        if (!committed)
+        {
+            for (PendingMemory const& memory : memories)
+            {
+                AddMemory(context.botGuid, context.otherGuid, memory.kind, memory.text, memory.salience);
+            }
+
+            if (hasRelationshipChange)
+            {
+                ApplyRelationshipDelta(context.botGuid, context.otherGuid, context.otherIsBot,
+                                       affinityChange, affinityReason);
+            }
+        }
+
+        OnLineSpoken(context.botGuid, context.botName, result.reply, context.key,
+                     context.channelName, context.chainDepth);
+    }
 }
 
-bool RequestBotTurn(TurnRequest& request, bool forced)
+bool RequestBotTurn(TurnRequest& request, bool priority)
 {
     if (!g_Enable || !request.bot)
         return false;
-
     if (g_DisableRepliesInCombat && request.bot->IsInCombat())
         return false;
-
-    // Check audibility before spending a call, not just before speaking: a say
-    // nobody is close enough to hear gets dropped on arrival, and paying for a
-    // line that never lands is the one waste that is entirely avoidable.
     if (request.key.scope == ChatScope::Say && !RealPlayerWithinSayRange(request.bot))
         return false;
-
-    if (!BotMindsGovernor::Allow(request.bot, request.other, request.key.scope, forced))
+    if (!BotMindsGovernor::Allow(request.bot, request.other, request.key, priority))
         return false;
 
     TurnPrompt prompt = BuildTurnPrompt(request);
     if (prompt.system.empty())
         return false;
 
-    const uint64_t    botGuid       = request.bot->GetGUID().GetRawValue();
-    const uint64_t    otherGuid     = request.other ? request.other->GetGUID().GetRawValue() : 0;
-    const bool        otherIsBot    = request.other && PlayerbotsMgr::instance().GetPlayerbotAI(request.other) != nullptr;
-    const std::string botName       = request.bot->GetName();
-    const std::string whisperTarget = request.other ? request.other->GetName() : "";
-    const ScopeKey    key           = request.key;
-    const std::string channelName   = request.channelName;
-    const uint32_t    chainDepth    = request.chainDepth;
-    const TurnKind    kind          = request.kind;
-    const ActionMenu  menu          = request.menu;
-    const bool        namedDirectly = request.namedDirectly;
+    LLMProviderPtr provider = GetProvider();
+    if (!provider)
+        return false;
 
-    BotMindsGovernor::OnSubmit(botGuid);
+    BotTurnContext context;
+    context.botGuid = request.bot->GetGUID().GetRawValue();
+    context.otherGuid = request.other ? request.other->GetGUID().GetRawValue() : 0;
+    context.otherIsBot = request.other
+        && PlayerbotsMgr::instance().GetPlayerbotAI(request.other) != nullptr;
+    context.namedDirectly = request.namedDirectly;
+    context.replyRequired = request.replyRequired;
+    context.botName = request.bot->GetName();
+    context.whisperTarget = request.other ? request.other->GetName() : "";
+    context.key = request.key;
+    context.channelName = request.channelName;
+    context.chainDepth = request.chainDepth;
+    context.kind = request.kind;
+    context.menu = request.menu;
 
-    ILLMProvider* provider = GetProvider();
+    bool const holdForConversation = priority && request.key.scope == ChatScope::Say
+        && request.other && !context.otherIsBot && !request.bot->IsInCombat()
+        && !(request.bot->GetGroup() && request.bot->GetGroup()->IsMember(request.other->GetGUID()));
+    uint64_t const holdBotGuid = context.botGuid;
+    uint64_t const holdTargetGuid = context.otherGuid;
 
-    std::thread([=, system = std::move(prompt.system), user = std::move(prompt.user)]()
+    BotMindsDispatchRequest dispatch;
+    dispatch.provider = std::move(provider);
+    dispatch.systemPrompt = std::move(prompt.system);
+    dispatch.userPrompt = std::move(prompt.user);
+    dispatch.label = context.botName;
+    dispatch.governorBotGuid = context.botGuid;
+    dispatch.governorScopeKey = context.key;
+    dispatch.holdsGovernorSlot = true;
+    dispatch.simulateTyping = g_EnableTypingSimulation;
+    dispatch.typingBaseDelayMs = g_TypingSimulationBaseDelay;
+    dispatch.typingDelayPerCharMs = g_TypingSimulationDelayPerChar;
+    dispatch.typingMaxDelayMs = g_TypingSimulationMaxDelay;
+    dispatch.onComplete = [context = std::move(context)](LLMResult&& result)
     {
-        SlotGuard slot;
+        CompleteBotTurn(context, std::move(result));
+    };
 
-        try
+    if (!BotMindsDispatch_Submit(std::move(dispatch)))
+        return false;
+
+    // A player should not lose a local conversation because the bot wandered out
+    // of earshot while the provider was thinking or the typing delay was running.
+    // The existing hold is refreshed after delivery, so normal AI resumes after
+    // the configured quiet period exactly as before.
+    if (holdForConversation)
+    {
+        HoldStillForConversation(holdBotGuid, holdTargetGuid);
+        if (g_DebugEnabled)
         {
-            LLMResult result = provider->Complete(system, user);
-
-            // A bot that owes someone an answer speaks as long as it produced
-            // words, even if it also set should_reply false. Only turns it was
-            // merely offered are allowed to decline.
-            const bool declined = !result.shouldReply && !forced;
-
-            if (!result.ok || declined || result.reply.empty())
-            {
-                if (g_DebugEnabled)
-                    LOG_INFO("server.loading", "[BotMinds] {} stayed silent ({}).",
-                             botName, result.ok ? "chose not to reply" : "no usable response");
-                return;
-            }
-
-            std::string reply = std::move(result.reply);
-            StripNamePrefix(reply, botName);
-            if (reply.empty())
-                return;
-
-            if (g_EnableTypingSimulation)
-            {
-                uint32_t delay = g_TypingSimulationBaseDelay + (reply.length() * g_TypingSimulationDelayPerChar);
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-            }
-
-            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(botGuid));
-            if (!bot || !bot->IsInWorld())
-                return;
-
-            PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-            if (!botAI)
-                return;
-
-            if (!SpeakInScope(bot, botAI, reply, key.scope, channelName, whisperTarget))
-            {
-                if (g_DebugEnabled)
-                    LOG_INFO("server.loading", "[BotMinds] {} could not speak in {}; line dropped.",
-                             botName, ScopeName(key.scope));
-                return;
-            }
-
-            if (g_DebugEnabled)
-                LOG_INFO("server.loading", "[BotMinds] {} ({} in {}): {}",
-                         botName, static_cast<int>(kind), ScopeName(key.scope), reply);
-
-            // A person would stop walking to type. Group members are left alone:
-            // they follow you anyway, and planting them would strand them if you
-            // are on the move.
-            if (!otherIsBot && otherGuid != 0 && !bot->IsInCombat()
-                && !(bot->GetGroup() && bot->GetGroup()->IsMember(ObjectGuid(otherGuid))))
-            {
-                HoldStillForConversation(botGuid, otherGuid);
-            }
-
-            RecordChatLine(key, botGuid, botName, reply);
-
-            // Answering a person puts this bot in conversation with them, so their
-            // next message comes back here rather than to whoever spoke last.
-            if (!otherIsBot && otherGuid != 0
-                && (kind == TurnKind::DirectReply || kind == TurnKind::Interjection))
-            {
-                SetConversationFloor(key, otherGuid, botGuid);
-            }
-
-            // Whatever the bot wanted to remember, and how it now feels, gathered
-            // up before we know whether there is an action to hang it on.
-            std::vector<PendingMemory> memories;
-
-            // Idle remarks are not worth remembering; they would crowd out the
-            // memories that matter.
-            if (kind != TurnKind::Ambient && result.memory_additions.is_array())
-            {
-                for (const auto& entry : result.memory_additions)
-                {
-                    std::string text = entry.value("text", "");
-                    if (text.empty())
-                        continue;
-
-                    PendingMemory memory;
-                    memory.kind     = entry.value("kind", "event");
-                    memory.text     = std::move(text);
-                    memory.salience = entry.value("salience", 0.5f);
-                    memories.push_back(std::move(memory));
-                }
-            }
-
-            // Worth saying out loud, because an empty memory list looks identical to
-            // a working one from the outside: bots quietly stopped remembering
-            // anything for a while and only a database check found it.
-            if (g_DebugEnabled && kind != TurnKind::Ambient && memories.empty())
-            {
-                LOG_INFO("server.loading", "[BotMinds] {} came back with nothing to remember.", botName);
-            }
-
-            const bool hasRelationshipChange = (otherGuid != 0 && result.relationship_delta.is_object());
-            const float affinityChange = hasRelationshipChange
-                ? result.relationship_delta.value("affinity_change", 0.0f) : 0.0f;
-            const std::string affinityReason = hasRelationshipChange
-                ? result.relationship_delta.value("reason", std::string()) : std::string();
-
-            // A gesture is part of how the line was said, so it is independent of
-            // any action and goes through the queue on its own. ResolveEmote also
-            // enforces the cooldown, so an over-eager model changes nothing.
-            if (!result.emote.empty() && !otherIsBot && otherGuid != 0)
-            {
-                if (uint32_t emoteId = ResolveEmote(botGuid, result.emote))
-                {
-                    BotAction gesture;
-                    gesture.kind       = ActionKind::Emote;
-                    gesture.botGuid    = botGuid;
-                    gesture.targetGuid = otherGuid;
-                    gesture.emoteId    = emoteId;
-                    SubmitBotAction(gesture);
-                }
-            }
-
-            // Say it first, then do it. That is the order a person would use, and it
-            // means the words are already out if the action needs a retry or two.
-            bool committed = false;
-
-            if (result.action.is_object())
-            {
-                BotAction action;
-                action.botGuid    = botGuid;
-                action.targetGuid = otherGuid;
-                action.kind       = ActionKindFromName(result.action.value("kind", std::string("none")));
-                action.spellName  = result.action.value("spell", std::string());
-                action.copper     = result.action.value("copper", 0u);
-                action.promised    = (kind == TurnKind::DirectReply || kind == TurnKind::Interjection);
-
-                // Did the bot already say it was posting the money? Checked here
-                // because this is where the spoken words are.
-                std::string lowered = reply;
-                for (char& c : lowered)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-                for (const char* hint : { "mail", "post", "inbox", "sent it", "send it" })
-                {
-                    if (lowered.find(hint) != std::string::npos)
-                    {
-                        action.mentionedPost = true;
-                        break;
-                    }
-                }
-
-                // "stay here" in a party is aimed at the party. Only a bot singled
-                // out by name gets to be the only one who obeys.
-                action.wholeGroup = !namedDirectly
-                    && key.scope == ChatScope::Party
-                    && (action.kind == ActionKind::Follow || action.kind == ActionKind::Stay);
-
-                if (action.kind != ActionKind::None && ValidateAction(menu, action))
-                {
-                    // The memories ride with the action rather than being written
-                    // now, because a bot that says "sure, here's a heal" and then
-                    // fails should not be left remembering a heal it never cast.
-                    action.memories              = std::move(memories);
-                    action.otherIsBot            = otherIsBot;
-                    action.hasRelationshipChange = hasRelationshipChange;
-                    action.affinityChange        = affinityChange;
-                    action.affinityReason        = affinityReason;
-
-                    SubmitBotAction(action);
-                    memories.clear();
-                    committed = true;
-                }
-                else if (g_DebugEnabled && action.kind != ActionKind::None)
-                {
-                    LOG_INFO("server.loading",
-                             "[BotMinds] Dropped an action {} tried to take that was not on offer.", botName);
-                }
-            }
-
-            // No action to wait on, so nothing was promised that could fall through.
-            if (!committed)
-            {
-                for (const PendingMemory& memory : memories)
-                    AddMemory(botGuid, otherGuid, memory.kind, memory.text, memory.salience);
-
-                if (hasRelationshipChange)
-                    ApplyRelationshipDelta(botGuid, otherGuid, otherIsBot, affinityChange, affinityReason);
-            }
-
-            // A bot speaking can draw a reply from another bot, up to the chain limit.
-            OnLineSpoken(botGuid, botName, reply, key, channelName, chainDepth);
+            LOG_INFO("server.loading", "[BotMinds] {} paused for conversation while its reply is prepared.",
+                     request.bot->GetName());
         }
-        catch (const std::exception& ex)
-        {
-            LOG_ERROR("server.loading", "[BotMinds] Exception in bot turn thread: {}", ex.what());
-        }
-    }).detach();
+    }
 
     return true;
 }

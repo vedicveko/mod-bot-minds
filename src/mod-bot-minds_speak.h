@@ -11,9 +11,9 @@
 // write-back. There is deliberately no second route.
 // --------------------------------------------
 
-// `forced` marks a line the bot owes the person who addressed it: it skips the
-// per-bot cooldown and the proximity check. Returns true if a call was
-// submitted, false if the bot stays silent.
-bool RequestBotTurn(TurnRequest& request, bool forced);
+// `priority` bypasses conversational pacing for a turn addressed to this bot.
+// Whether the model is allowed to remain silent is carried separately by
+// TurnRequest::replyRequired. Returns true if a call was submitted.
+bool RequestBotTurn(TurnRequest& request, bool priority);
 
 #endif // MOD_BOT_MINDS_SPEAK_H

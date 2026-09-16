@@ -4,8 +4,14 @@
 #include "DatabaseEnv.h"
 #include "QueryResult.h"
 #include "Field.h"
+#include "ObjectAccessor.h"
+#include "ObjectMgr.h"
+#include "Player.h"
+#include "QuestDef.h"
 #include <fmt/core.h>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <deque>
@@ -42,6 +48,8 @@ namespace
         time_t      createdAt = 0;
         time_t      lastReferenced = 0;   // 0 == never went into a prompt
         uint32_t    refCount = 0;
+        std::string actionHint;
+        std::string actionState = "none";
     };
 
     // A use of a memory that has not reached the database yet. It copies the
@@ -90,6 +98,54 @@ namespace
     {
         return subjectGuid == 0 ? "subject_guid IS NULL"
                                 : SafeFormat("subject_guid = {}", subjectGuid);
+    }
+
+    std::string Lower(std::string text)
+    {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char character)
+        {
+            return static_cast<char>(std::tolower(character));
+        });
+        return text;
+    }
+
+    bool Recallable(MemoryRow const& row)
+    {
+        return row.actionState != "done" && row.actionState != "failed";
+    }
+
+    // Tag generated memories that name a quest either actor is actively doing.
+    // Completion can then retire the intention without rewriting model prose.
+    void InferQuestLifecycle(MemoryRow& row)
+    {
+        std::string const loweredText = Lower(row.text);
+        std::array<uint64_t, 2> const possibleActors = { row.subjectGuid, row.botGuid };
+
+        for (uint64_t guid : possibleActors)
+        {
+            if (guid == 0)
+                continue;
+
+            Player* player = ObjectAccessor::FindPlayer(ObjectGuid(guid));
+            if (!player)
+                continue;
+
+            for (auto const& status : player->getQuestStatusMap())
+            {
+                if (status.second.Status != QUEST_STATUS_INCOMPLETE)
+                    continue;
+
+                Quest const* quest = sObjectMgr->GetQuestTemplate(status.first);
+                if (!quest || quest->GetTitle().size() < 4)
+                    continue;
+                if (loweredText.find(Lower(quest->GetTitle())) == std::string::npos)
+                    continue;
+
+                row.actionHint = SafeFormat("quest:{}", status.first);
+                row.actionState = "pending";
+                return;
+            }
+        }
     }
 
     // What a memory is worth right now:
@@ -176,22 +232,29 @@ namespace
     {
         std::string escText = row.text;
         std::string escKind = row.kind;
+        std::string escHint = row.actionHint;
         CharacterDatabase.EscapeString(escText);
         CharacterDatabase.EscapeString(escKind);
+        CharacterDatabase.EscapeString(escHint);
+
+        std::string const hintValue = escHint.empty() ? "NULL" : SafeFormat("'{}'", escHint);
 
         if (row.subjectGuid == 0)
         {
             CharacterDatabase.Execute(SafeFormat(
-                "INSERT INTO mod_bot_minds_memory (bot_guid, subject_guid, kind, text, salience) "
-                "VALUES ({}, NULL, '{}', '{}', {:.3f})",
-                row.botGuid, escKind, escText, row.salience));
+                "INSERT INTO mod_bot_minds_memory "
+                "(bot_guid, subject_guid, kind, text, salience, action_hint, action_state) "
+                "VALUES ({}, NULL, '{}', '{}', {:.3f}, {}, '{}')",
+                row.botGuid, escKind, escText, row.salience, hintValue, row.actionState));
         }
         else
         {
             CharacterDatabase.Execute(SafeFormat(
-                "INSERT INTO mod_bot_minds_memory (bot_guid, subject_guid, kind, text, salience) "
-                "VALUES ({}, {}, '{}', '{}', {:.3f})",
-                row.botGuid, row.subjectGuid, escKind, escText, row.salience));
+                "INSERT INTO mod_bot_minds_memory "
+                "(bot_guid, subject_guid, kind, text, salience, action_hint, action_state) "
+                "VALUES ({}, {}, '{}', '{}', {:.3f}, {}, '{}')",
+                row.botGuid, row.subjectGuid, escKind, escText, row.salience,
+                hintValue, row.actionState));
         }
     }
 
@@ -201,24 +264,34 @@ namespace
     // thirty copies of one line would push out everything else. Keeping the text
     // unique also keeps the database updates unambiguous, since text is what
     // identifies a row here.
-    bool RefreshExisting(std::deque<MemoryRow>& bucket, const std::string& text, float salience, time_t now)
+    bool RefreshExisting(std::deque<MemoryRow>& bucket, MemoryRow const& incoming, time_t now)
     {
         for (size_t i = 0; i < bucket.size(); ++i)
         {
-            if (bucket[i].kind == "summary" || bucket[i].text != text)
+            if (bucket[i].kind == "summary" || bucket[i].text != incoming.text)
                 continue;
 
             MemoryRow row = bucket[i];
-            row.salience  = std::max(row.salience, salience);
+            row.salience  = std::max(row.salience, incoming.salience);
             row.createdAt = now;
+            if (!incoming.actionHint.empty())
+            {
+                row.actionHint = incoming.actionHint;
+                row.actionState = incoming.actionState;
+            }
 
             std::string escText = row.text;
+            std::string escHint = row.actionHint;
             CharacterDatabase.EscapeString(escText);
+            CharacterDatabase.EscapeString(escHint);
+
+            std::string const hintValue = escHint.empty() ? "NULL" : SafeFormat("'{}'", escHint);
 
             CharacterDatabase.Execute(SafeFormat(
-                "UPDATE mod_bot_minds_memory SET salience = {:.3f}, created_at = FROM_UNIXTIME({}) "
+                "UPDATE mod_bot_minds_memory SET salience = {:.3f}, created_at = FROM_UNIXTIME({}), "
+                "action_hint = {}, action_state = '{}' "
                 "WHERE bot_guid = {} AND {} AND text = '{}'",
-                row.salience, static_cast<uint64_t>(now),
+                row.salience, static_cast<uint64_t>(now), hintValue, row.actionState,
                 row.botGuid, SubjectClause(row.subjectGuid), escText));
 
             bucket.erase(bucket.begin() + i);
@@ -388,8 +461,14 @@ namespace
         float droppedSalience = 0.0f;
         for (size_t idx : removeIdx)
         {
-            fragments.push_back(Fragment(bucket[idx].text));
-            droppedSalience = std::max(droppedSalience, bucket[idx].salience);
+            // A resolved intention is deliberately retired, not folded into a
+            // summary where its old present-tense wording could become active
+            // context again.
+            if (Recallable(bucket[idx]))
+            {
+                fragments.push_back(Fragment(bucket[idx].text));
+                droppedSalience = std::max(droppedSalience, bucket[idx].salience);
+            }
         }
 
         // Highest index first so the earlier indices stay valid.
@@ -433,6 +512,8 @@ std::vector<MemoryEntry> GetRecentMemories(uint64_t botGuid, uint64_t subjectGui
     std::deque<MemoryRow>& bucket = subIt->second;
     for (auto it = bucket.rbegin(); it != bucket.rend() && out.size() < static_cast<size_t>(n); ++it)
     {
+        if (!Recallable(*it))
+            continue;
         MarkReferenced(*it, now);
         out.push_back(ToEntry(*it));
     }
@@ -462,7 +543,8 @@ std::vector<MemoryEntry> GetRelevantMemories(uint64_t botGuid, uint64_t subjectG
         auto it = bySubject.find(key);
         if (it != bySubject.end())
             for (MemoryRow& row : it->second)
-                candidates.push_back(&row);
+                if (Recallable(row))
+                    candidates.push_back(&row);
     };
 
     collect(botIt->second, subjectGuid);
@@ -509,12 +591,13 @@ void AddMemory(uint64_t botGuid, uint64_t subjectGuid, const std::string& kind,
     row.text        = text;
     row.salience    = salience;
     row.createdAt   = now;
+    InferQuestLifecycle(row);
 
     {
         std::lock_guard<std::mutex> lock(g_MemoryMutex);
 
         std::deque<MemoryRow>& bucket = g_Memories[botGuid][subjectGuid];
-        if (!RefreshExisting(bucket, row.text, row.salience, now))
+        if (!RefreshExisting(bucket, row, now))
         {
             bucket.push_back(row);
             InsertRow(row);
@@ -529,6 +612,65 @@ void AddMemory(uint64_t botGuid, uint64_t subjectGuid, const std::string& kind,
     }
 
     DistillOldMemories(botGuid, subjectGuid);
+}
+
+void ResolveQuestMemories(uint64_t actorGuid, uint32_t questId, const std::string& questTitle)
+{
+    if (actorGuid == 0 || questId == 0 || questTitle.empty())
+        return;
+
+    std::string const hint = SafeFormat("quest:{}", questId);
+    std::string const loweredTitle = Lower(questTitle);
+    static std::array<std::string, 7> const activePhrases = {
+        "working on", "part way", "trying to", "needs to", "need to", "unfinished", "doing"
+    };
+
+    uint32_t resolved = 0;
+    std::lock_guard<std::mutex> lock(g_MemoryMutex);
+
+    for (auto& botEntry : g_Memories)
+    {
+        for (auto& subjectEntry : botEntry.second)
+        {
+            if (subjectEntry.first != actorGuid && botEntry.first != actorGuid)
+                continue;
+
+            for (MemoryRow& row : subjectEntry.second)
+            {
+                if (row.actionState == "done" || row.actionState == "failed")
+                    continue;
+
+                std::string const loweredText = Lower(row.text);
+                bool const explicitlyTagged = row.actionHint == hint;
+                bool const namesQuest = loweredText.find(loweredTitle) != std::string::npos;
+                bool const soundsUnfinished = namesQuest && std::any_of(
+                    activePhrases.begin(), activePhrases.end(), [&](std::string const& phrase)
+                    {
+                        return loweredText.find(phrase) != std::string::npos;
+                    });
+
+                if (!explicitlyTagged && !soundsUnfinished)
+                    continue;
+
+                row.actionHint = hint;
+                row.actionState = "done";
+
+                std::string escText = row.text;
+                CharacterDatabase.EscapeString(escText);
+                CharacterDatabase.Execute(SafeFormat(
+                    "UPDATE mod_bot_minds_memory SET action_hint = '{}', action_state = 'done' "
+                    "WHERE bot_guid = {} AND {} AND text = '{}' LIMIT 1",
+                    hint, row.botGuid, SubjectClause(row.subjectGuid), escText));
+                ++resolved;
+            }
+        }
+    }
+
+    if (g_DebugEnabled && resolved > 0)
+    {
+        LOG_INFO("server.loading", "[BotMinds] Resolved {} active memories for completed quest {}.",
+                 resolved, questTitle);
+    }
 }
 
 void DistillOldMemories(uint64_t botGuid, uint64_t subjectGuid)
@@ -565,7 +707,7 @@ void LoadMemoriesFromDB()
 
     QueryResult result = CharacterDatabase.Query(
         "SELECT bot_guid, subject_guid, kind, text, salience, UNIX_TIMESTAMP(created_at), "
-        "UNIX_TIMESTAMP(last_referenced), ref_count "
+        "UNIX_TIMESTAMP(last_referenced), ref_count, action_hint, action_state "
         "FROM mod_bot_minds_memory ORDER BY id ASC");
 
     if (!result)
@@ -587,6 +729,8 @@ void LoadMemoriesFromDB()
         row.createdAt      = fields[5].IsNull() ? 0 : static_cast<time_t>(fields[5].Get<uint64_t>());
         row.lastReferenced = fields[6].IsNull() ? 0 : static_cast<time_t>(fields[6].Get<uint64_t>());
         row.refCount       = fields[7].Get<uint32_t>();
+        row.actionHint     = fields[8].IsNull() ? "" : fields[8].Get<std::string>();
+        row.actionState    = fields[9].Get<std::string>();
 
         g_Memories[row.botGuid][row.subjectGuid].push_back(std::move(row));
         ++count;

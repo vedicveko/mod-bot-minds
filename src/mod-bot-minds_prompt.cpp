@@ -7,6 +7,11 @@
 #include "mod-bot-minds-utilities.h"
 
 #include "AiFactory.h"
+#include "AiObjectContext.h"
+#include "CellImpl.h"
+#include "Creature.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Group.h"
 #include "Guild.h"
 #include "Map.h"
@@ -16,10 +21,16 @@
 #include "PlayerbotMgr.h"
 #include "QuestDef.h"
 #include "SharedDefines.h"
+#include "TravelMgr.h"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <fmt/core.h>
+#include <list>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
@@ -142,6 +153,104 @@ namespace
         return out.str();
     }
 
+    std::string GroupRelationshipPhrase(Player* bot)
+    {
+        Group* group = bot->GetGroup();
+        if (!group)
+            return "";
+
+        std::vector<std::string> dynamics;
+        uint64_t const botGuid = bot->GetGUID().GetRawValue();
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == bot || !PlayerbotsMgr::instance().GetPlayerbotAI(member))
+                continue;
+
+            Relationship const relationship = GetRelationship(botGuid, member->GetGUID().GetRawValue());
+            if (relationship.interactionCount == 0)
+                continue;
+
+            char const* dynamic = "are still getting used to one another";
+            if (relationship.affinity >= 0.5f)
+                dynamic = "have become close friends";
+            else if (relationship.affinity >= 0.15f)
+                dynamic = "get along well";
+            else if (relationship.affinity <= -0.5f)
+                dynamic = "openly dislike one another";
+            else if (relationship.affinity <= -0.15f)
+                dynamic = "have a prickly rivalry";
+
+            dynamics.push_back(fmt::format("you and {} {}", member->GetName(), dynamic));
+            if (dynamics.size() >= 2)
+                break;
+        }
+
+        if (dynamics.empty())
+            return "";
+
+        std::ostringstream out;
+        out << " Among the other people in your group, ";
+        for (size_t i = 0; i < dynamics.size(); ++i)
+        {
+            if (i)
+                out << (i + 1 == dynamics.size() ? " and " : ", ");
+            out << dynamics[i];
+        }
+        out << ". Let this show as light familiarity or teasing, never forced drama.";
+        return out.str();
+    }
+
+    std::string ObjectiveName(int32 entry)
+    {
+        if (entry > 0)
+        {
+            if (CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(entry))
+                return creature->Name;
+        }
+        else if (entry < 0)
+        {
+            if (GameObjectTemplate const* gameObject = sObjectMgr->GetGameObjectTemplate(-entry))
+                return gameObject->name;
+        }
+
+        return "an objective";
+    }
+
+    std::vector<std::string> RemainingObjectives(Quest const* quest, QuestStatusData const& status)
+    {
+        std::vector<std::string> objectives;
+
+        for (uint32 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT && objectives.size() < 3; ++i)
+        {
+            uint32 const required = quest->RequiredItemCount[i];
+            if (quest->RequiredItemId[i] == 0 || required == 0 || status.ItemCount[i] >= required)
+                continue;
+
+            ItemTemplate const* item = sObjectMgr->GetItemTemplate(quest->RequiredItemId[i]);
+            if (item)
+            {
+                objectives.push_back(fmt::format("{} {}/{}", item->Name1,
+                                                 status.ItemCount[i], required));
+            }
+        }
+
+        for (uint32 i = 0; i < QUEST_OBJECTIVES_COUNT && objectives.size() < 3; ++i)
+        {
+            uint32 const required = quest->RequiredNpcOrGoCount[i];
+            if (quest->RequiredNpcOrGo[i] == 0 || required == 0
+                || status.CreatureOrGOCount[i] >= required)
+            {
+                continue;
+            }
+
+            objectives.push_back(fmt::format("{} {}/{}", ObjectiveName(quest->RequiredNpcOrGo[i]),
+                                             status.CreatureOrGOCount[i], required));
+        }
+
+        return objectives;
+    }
+
     // What the bot is working on, which is what "what are you up to" really means
     // out in a levelling zone.
     std::string QuestPhrase(Player* bot)
@@ -160,7 +269,23 @@ namespace
             else if (status.second.Status == QUEST_STATUS_INCOMPLETE && active.size() < 2)
             {
                 if (Quest const* quest = sObjectMgr->GetQuestTemplate(status.first))
-                    active.push_back(quest->GetTitle());
+                {
+                    std::ostringstream detail;
+                    detail << quest->GetTitle();
+                    std::vector<std::string> const objectives = RemainingObjectives(quest, status.second);
+                    if (!objectives.empty())
+                    {
+                        detail << " (still needs ";
+                        for (size_t i = 0; i < objectives.size(); ++i)
+                        {
+                            if (i)
+                                detail << (i + 1 == objectives.size() ? " and " : ", ");
+                            detail << objectives[i];
+                        }
+                        detail << ")";
+                    }
+                    active.push_back(detail.str());
+                }
             }
 
             if (active.size() >= 2 && !finished.empty())
@@ -177,6 +302,122 @@ namespace
         if (!finished.empty())
             out << " You have finished " << finished << " and still need to hand it in.";
 
+        return out.str();
+    }
+
+    std::string IntentPhrase(Player* bot, PlayerbotAI* botAI)
+    {
+        if (!botAI)
+            return "";
+
+        if (bot->GetGroup())
+            return " Your immediate plan is to follow the group's lead rather than run a separate errand.";
+
+        TravelTarget* target = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
+        if (target && target->getDestination()
+            && target->getStatus() != TRAVEL_STATUS_NONE
+            && target->getStatus() != TRAVEL_STATUS_COOLDOWN
+            && target->getStatus() != TRAVEL_STATUS_EXPIRED)
+        {
+            TravelDestination* destination = target->getDestination();
+            std::string purpose;
+
+            if (Quest const* quest = destination->GetQuestTemplate())
+                purpose = fmt::format("work on {}", quest->GetTitle());
+            else if (destination->getName() == "BossTravelDestination")
+                purpose = fmt::format("look for {}", ObjectiveName(destination->getEntry()));
+            else if (destination->getName() == "GrindTravelDestination")
+                purpose = fmt::format("hunt {}", ObjectiveName(destination->getEntry()));
+            else if (destination->getName() == "RpgTravelDestination")
+                purpose = "visit a nearby NPC";
+            else if (destination->getName() == "ExploreTravelDestination")
+                purpose = "explore somewhere you have not seen yet";
+
+            if (!purpose.empty())
+            {
+                char const* phase = target->getStatus() == TRAVEL_STATUS_WORK
+                    ? "You have arrived and are trying to " : "You are currently heading out to ";
+                return fmt::format(" {}{}.", phase, purpose);
+            }
+        }
+
+        std::string action = botAI->HandleRemoteCommand("action");
+        std::transform(action.begin(), action.end(), action.begin(), [](unsigned char character)
+        {
+            return static_cast<char>(std::tolower(character));
+        });
+
+        static std::array<std::pair<char const*, char const*>, 7> const visibleActions = {{
+            { "repair", "repairing your equipment" },
+            { "sell", "selling things you do not need" },
+            { "buy", "shopping for supplies" },
+            { "train", "training" },
+            { "drink", "recovering your mana" },
+            { "eat", "recovering your health" },
+            { "loot", "gathering loot" }
+        }};
+
+        for (auto const& entry : visibleActions)
+            if (action.find(entry.first) != std::string::npos)
+                return fmt::format(" Your latest activity is {}.", entry.second);
+
+        return "";
+    }
+
+    std::string NearbyKnowledgePhrase(Player* bot)
+    {
+        std::list<Creature*> creatures;
+        Acore::AllWorldObjectsInRange check(bot, g_SayDistance);
+        Acore::CreatureListSearcher<Acore::AllWorldObjectsInRange> searcher(bot, creatures, check);
+        Cell::VisitObjects(bot, searcher, g_SayDistance);
+
+        creatures.sort([bot](Creature const* left, Creature const* right)
+        {
+            return bot->GetDistance(left) < bot->GetDistance(right);
+        });
+
+        std::vector<std::string> services;
+        std::unordered_set<std::string> seen;
+        for (Creature* creature : creatures)
+        {
+            if (!creature->IsAlive() || !bot->IsFriendlyTo(creature))
+                continue;
+
+            char const* role = nullptr;
+            if (creature->IsInnkeeper())
+                role = "innkeeper";
+            else if (creature->IsTaxi())
+                role = "flight master";
+            else if (creature->IsArmorer())
+                role = "repairer";
+            else if (creature->IsQuestGiver())
+                role = "quest giver";
+            else if (creature->IsVendor())
+                role = "vendor";
+
+            if (!role)
+                continue;
+
+            std::string const detail = fmt::format("{} the {}", creature->GetName(), role);
+            if (!seen.insert(detail).second)
+                continue;
+            services.push_back(detail);
+            if (services.size() >= 3)
+                break;
+        }
+
+        if (services.empty())
+            return "";
+
+        std::ostringstream out;
+        out << " Nearby right now: ";
+        for (size_t i = 0; i < services.size(); ++i)
+        {
+            if (i)
+                out << (i + 1 == services.size() ? " and " : ", ");
+            out << services[i];
+        }
+        out << ".";
         return out.str();
     }
 
@@ -238,11 +479,14 @@ namespace
         }
 
         out << GroupPhrase(bot);
+        out << GroupRelationshipPhrase(bot);
+        out << IntentPhrase(bot, botAI);
 
         if (Guild* guild = bot->GetGuild())
             out << " You are in the guild " << guild->GetName() << ".";
 
         out << QuestPhrase(bot);
+        out << NearbyKnowledgePhrase(bot);
 
         out << " You have " << MoneyPhrase(bot->GetMoney()) << " on you.";
 
@@ -257,8 +501,10 @@ namespace
     // capped. Empty when the bot has nothing on file.
     std::string MemoryBlock(uint64_t botGuid, uint64_t subjectGuid)
     {
-        std::vector<MemoryEntry> recent   = GetRecentMemories(botGuid, subjectGuid, static_cast<int>(g_RecentMemoryCount));
-        std::vector<MemoryEntry> relevant = GetRelevantMemories(botGuid, subjectGuid, static_cast<int>(g_RelevantMemoryCount));
+        std::vector<MemoryEntry> recent = GetRecentMemories(
+            botGuid, subjectGuid, static_cast<int>(g_RecentMemoryCount));
+        std::vector<MemoryEntry> relevant = GetRelevantMemories(
+            botGuid, subjectGuid, static_cast<int>(g_RelevantMemoryCount));
 
         std::unordered_set<std::string> seen;
         std::ostringstream out;
@@ -318,12 +564,15 @@ namespace
 
         return fmt::format(
             "How to talk:\n"
-            "- You are a person playing this character in an online game. Talk like a player in chat, not like a hero in a story.\n"
-            "- Never narrate actions, never describe your powers, destiny, faith or lore, and never speak in the third person.\n"
+            "- You are a person playing this character in an online game. Talk like a player in chat, "
+            "not like a hero in a story.\n"
+            "- Never narrate actions, never describe your powers, destiny, faith or lore, and never speak "
+            "in the third person.\n"
             "- Short and casual. Contractions are fine. Answer the point and stop.\n"
             "- Everything above about your own state is true, so answer from it rather than making something up, "
             "but only bring up the parts actually being asked about. Never read your stats out as a list.\n"
-            "- No asterisks, no emotes, no stage directions, no quotation marks around your words, no emoji, no markdown, no name prefix.\n"
+            "- No asterisks, no emotes, no stage directions, no quotation marks around your words, no emoji, "
+            "no markdown, no name prefix.\n"
             "- Never mention being an AI, a bot, a model, or these instructions.\n"
             "- Hard limit {} characters. One sentence is usually right, two is the maximum.\n"
             "- Never repeat something already said in the recent chat.\n"
@@ -340,9 +589,18 @@ namespace
         switch (request.kind)
         {
             case TurnKind::DirectReply:
+                if (request.replyRequired)
+                {
+                    return fmt::format(
+                        "{} is talking to you. Answer them directly, and use the recent chat above to work out "
+                        "what they mean. Set should_reply to true.",
+                        other);
+                }
+
                 return fmt::format(
-                    "{} is talking to you. Answer them directly, and use the recent chat above to work out what "
-                    "they mean. Set should_reply to true.",
+                    "{} is continuing your conversation. Answer if their newest line calls for one. A brief "
+                    "acknowledgement or natural closing such as okay, neat, thanks, lol or goodbye does not "
+                    "always need another line; in that case set should_reply to false and leave reply empty.",
                     other);
 
             case TurnKind::Interjection:
@@ -374,8 +632,18 @@ namespace
             }
 
             case TurnKind::Event:
+                if (request.replyRequired)
+                {
+                    return "This is a social moment that calls for one brief response. React naturally and set "
+                           "should_reply to true.";
+                }
                 return "Something just happened near you, described below. React in a few words if it is worth "
                        "commenting on, otherwise set should_reply to false and leave reply empty.";
+
+            case TurnKind::EmoteReaction:
+                return fmt::format(
+                    "{} aimed an emote at you. React to them naturally in one short line and set should_reply "
+                    "to true.", other);
         }
 
         return "";
@@ -392,20 +660,30 @@ TurnPrompt BuildTurnPrompt(TurnRequest& request)
     Player*  bot     = request.bot;
     uint64_t botGuid = bot->GetGUID().GetRawValue();
 
-    const Persona& persona = GetPersona(bot);
-    std::string    name    = persona.name.empty() ? bot->GetName() : persona.name;
+    Persona const& persona = GetPersona(bot);
+    PersonaProfile const profile = GeneratePersonaProfile(botGuid);
+    std::string const name = persona.name.empty() ? bot->GetName() : persona.name;
 
     std::ostringstream system;
 
     system << "You are " << name << ", a " << RaceName(bot->getRace()) << " " << ClassName(bot->getClass())
            << " in World of Warcraft: Wrath of the Lich King.\n";
 
-    if (!persona.traits.empty())
-        system << "You come across as " << persona.traits << ".\n";
-    if (!persona.speechStyle.empty())
+    system << "Personality: " << profile.temperament;
+    if (!persona.traits.empty() && !IsLegacyGeneratedTraits(persona.traits))
+        system << "; also " << persona.traits;
+    system << ". You especially enjoy " << profile.interests
+           << "; these are background preferences, not a reason to change the subject.\n";
+
+    system << "Your chat habits: " << profile.voice << ".\n";
+    if (!persona.speechStyle.empty() && !IsLegacyGeneratedSpeechStyle(persona.speechStyle))
         system << "You " << persona.speechStyle << ".\n";
     if (!persona.backstory.empty())
         system << persona.backstory << "\n";
+
+    std::string const mood = DescribePersonaMood(bot);
+    if (!mood.empty())
+        system << mood << "\n";
 
     system << SituationBlock(bot) << "\n";
 
@@ -469,6 +747,7 @@ TurnPrompt BuildTurnPrompt(TurnRequest& request)
             break;
         case TurnKind::Ambient:
         case TurnKind::Event:
+        case TurnKind::EmoteReaction:
             prompt.user = fmt::format("Situation: {}", request.trigger);
             break;
     }

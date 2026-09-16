@@ -7,6 +7,8 @@
 
 #include "Bag.h"
 #include "CellImpl.h"
+#include "Channel.h"
+#include "ChannelMgr.h"
 #include "Creature.h"
 #include "GameObject.h"
 #include "GridNotifiers.h"
@@ -23,49 +25,60 @@
 #include "QuestDef.h"
 #include "Random.h"
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
 {
-    std::unordered_map<uint64_t, time_t> g_NextAmbientTime;
-
-    // One favour per person per cooldown, so an unprompted buff stays a nice
-    // surprise rather than a fixture.
-    std::unordered_map<uint64_t, time_t> g_LastFavourAt;
-
-    // The nearest real player this bot could actually do something for, or null.
-    Player* FavourCandidate(Player* bot, time_t now)
+    struct AmbientSchedule
     {
-        if (!g_ActionsEnable || urand(0, 99) >= g_UnpromptedChance)
-            return nullptr;
+        time_t dueAt = 0;
+        time_t pausedAt = 0;
+    };
 
-        for (auto const& pair : ObjectAccessor::GetPlayers())
-        {
-            Player* candidate = pair.second;
-            if (!candidate || !candidate->IsInWorld())
-                continue;
-            if (PlayerbotsMgr::instance().GetPlayerbotAI(candidate))
-                continue;
-            if (candidate->GetMapId() != bot->GetMapId() || bot->GetDistance(candidate) > g_SayDistance)
-                continue;
+    // One timer per audible scene, not per bot. A crowded inn should produce one
+    // naturally spaced remark, not a wall of simultaneous requests from everyone
+    // whose personal timer happened to expire on the same world tick.
+    std::unordered_map<ScopeKey, AmbientSchedule, ScopeKeyHash> g_AmbientSchedules;
 
-            auto last = g_LastFavourAt.find(candidate->GetGUID().GetRawValue());
-            if (last != g_LastFavourAt.end() && now < last->second + (time_t)g_UnpromptedCooldownSec)
-                continue;
-
-            return candidate;
-        }
-
-        return nullptr;
-    }
+    // One passerby buff per person per cooldown, so kindness stays a nice surprise
+    // rather than becoming a permanent automatic service.
+    std::unordered_map<uint64_t, time_t> g_LastFavourAt;
 
     bool IsBot(Player* player)
     {
         PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(player);
         return ai && ai->IsBotAI();
+    }
+
+    Player* NearestRealPlayer(Player* bot, float maxDistance)
+    {
+        Player* nearest = nullptr;
+        float nearestDistance = 0.0f;
+
+        for (auto const& pair : ObjectAccessor::GetPlayers())
+        {
+            Player* candidate = pair.second;
+            if (!candidate || IsBot(candidate) || !candidate->IsInWorld())
+                continue;
+            if (candidate->GetMapId() != bot->GetMapId())
+                continue;
+
+            float const distance = bot->GetDistance(candidate);
+            if (distance > maxDistance)
+                continue;
+            if (!nearest || distance < nearestDistance)
+            {
+                nearest = candidate;
+                nearestDistance = distance;
+            }
+        }
+
+        return nearest;
     }
 
     // A group-mate always has an audience: party chat reaches the whole group
@@ -86,17 +99,160 @@ namespace
         return false;
     }
 
-    bool RealPlayerWithin(Player* bot, float distance)
+    bool RealPlayerInChannel(Channel* channel)
     {
+        if (!channel)
+            return false;
+
         for (auto const& pair : ObjectAccessor::GetPlayers())
         {
             Player* candidate = pair.second;
             if (!candidate || IsBot(candidate) || !candidate->IsInWorld())
                 continue;
-            if (candidate->GetMapId() == bot->GetMapId() && bot->GetDistance(candidate) <= distance)
+            if (IsInChannelInstance(candidate, channel))
                 return true;
         }
+
         return false;
+    }
+
+    Channel* ResolveChannel(Player* bot, uint32_t channelId)
+    {
+        ChannelMgr* manager = ChannelMgr::forTeam(bot->GetTeamId());
+        if (!manager)
+            return nullptr;
+
+        for (auto const& entry : manager->GetChannels())
+        {
+            Channel* channel = entry.second;
+            if (!channel || channel->GetChannelId() != channelId || channel->GetName().empty())
+                continue;
+            if (!IsInChannelInstance(bot, channel) || !RealPlayerInChannel(channel))
+                continue;
+
+            return channel;
+        }
+
+        return nullptr;
+    }
+
+    struct AmbientDestination
+    {
+        ChatScope scope = ChatScope::Say;
+        uint32_t channelId = 0;
+        std::string channelName;
+        ScopeKey key;
+    };
+
+    std::vector<AmbientDestination> FindDestinations(Player* bot)
+    {
+        std::vector<AmbientDestination> destinations;
+
+        if (RealPlayerInGroup(bot))
+        {
+            AmbientDestination destination;
+            destination.scope = ChatScope::Party;
+            destination.key = MakeScope(ChatScope::Party, bot);
+            destinations.push_back(std::move(destination));
+            return destinations;
+        }
+
+        if (Player* audience = NearestRealPlayer(bot, g_SayDistance))
+        {
+            AmbientDestination destination;
+            destination.scope = ChatScope::Say;
+            destination.key = MakeScope(ChatScope::Say, audience);
+            destinations.push_back(std::move(destination));
+        }
+
+        auto addChannel = [&](uint32_t channelId, bool enabled)
+        {
+            if (!enabled)
+                return;
+
+            Channel* channel = ResolveChannel(bot, channelId);
+            if (!channel)
+                return;
+
+            AmbientDestination option;
+            option.scope = ChatScope::Channel;
+            option.channelId = channel->GetChannelId();
+            option.channelName = channel->GetName();
+            option.key = MakeScope(ChatScope::Channel, bot, nullptr, option.channelId, option.channelName);
+            destinations.push_back(std::move(option));
+        };
+
+        addChannel(ChatChannelId::GENERAL, g_AmbientUseGeneralChannel);
+        addChannel(ChatChannelId::TRADE, g_AmbientUseTradeChannel);
+        addChannel(ChatChannelId::LOOKING_FOR_GROUP, g_AmbientUseLfgChannel);
+        addChannel(ChatChannelId::GUILD_RECRUITMENT, g_AmbientUseGuildRecruitmentChannel);
+
+        return destinations;
+    }
+
+    // Passing players used to buff one another without stopping for a conversation.
+    // Keep that separate from LLM chatter: choose a bot that genuinely has a
+    // missing, castable buff and queue the spell directly on the world thread.
+    void TryPasserbyBuffs(std::unordered_map<uint64_t, std::vector<Player*>>& nearbyBots,
+                          time_t now, std::unordered_set<uint64_t>& usedBots)
+    {
+        if (!g_ActionsEnable || g_UnpromptedChance == 0)
+            return;
+
+        for (auto& entry : nearbyBots)
+        {
+            Player* audience = ObjectAccessor::FindPlayer(ObjectGuid(entry.first));
+            if (!audience || !audience->IsInWorld() || !audience->IsAlive())
+                continue;
+
+            auto last = g_LastFavourAt.find(entry.first);
+            if (last != g_LastFavourAt.end()
+                && now < last->second + static_cast<time_t>(g_UnpromptedCooldownSec))
+            {
+                continue;
+            }
+
+            if (urand(0, 99) >= g_UnpromptedChance)
+                continue;
+
+            std::vector<Player*>& candidates = entry.second;
+            std::shuffle(candidates.begin(), candidates.end(), RandomEngine::Instance());
+
+            Player* chosenBot = nullptr;
+            PasserbyBuffChoice chosenBuff;
+            for (Player* bot : candidates)
+            {
+                if (!bot || usedBots.count(bot->GetGUID().GetRawValue()) != 0)
+                    continue;
+
+                ActionMenu const menu = BuildActionMenu(bot, audience, /*unprompted=*/true);
+                PasserbyBuffChoice const candidate = ChoosePasserbyBuff(bot, audience, menu);
+                if (candidate.score > chosenBuff.score)
+                {
+                    chosenBot = bot;
+                    chosenBuff = candidate;
+                }
+            }
+
+            if (!chosenBot)
+                continue;
+
+            BotAction action;
+            action.kind = ActionKind::Buff;
+            action.botGuid = chosenBot->GetGUID().GetRawValue();
+            action.targetGuid = audience->GetGUID().GetRawValue();
+            action.spellName = chosenBuff.spellName;
+            SubmitBotAction(action);
+
+            usedBots.insert(action.botGuid);
+            g_LastFavourAt[entry.first] = now;
+
+            if (g_DebugEnabled)
+            {
+                LOG_INFO("server.loading", "[BotMinds] {} chose passerby buff {} (score {}) for {}.",
+                         chosenBot->GetName(), action.spellName, chosenBuff.score, audience->GetName());
+            }
+        }
     }
 
     // Nearest interesting thing around the bot, described plainly. The prompt
@@ -125,7 +281,8 @@ namespace
 
         {
             GameObject* nearbyObject = nullptr;
-            Acore::GameObjectInRangeCheck check(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), g_SayDistance);
+            Acore::GameObjectInRangeCheck check(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                                                g_SayDistance);
             Acore::GameObjectSearcher<Acore::GameObjectInRangeCheck> searcher(bot, nearbyObject, check);
             Cell::VisitObjects(bot, searcher, g_SayDistance);
             if (nearbyObject)
@@ -205,13 +362,28 @@ namespace
             ? anyone[pick]
             : freeToRoam[pick - sizeof(anyone) / sizeof(anyone[0])];
     }
+
+    char const* ContextualGesture(Player* bot)
+    {
+        if (bot->HasRestFlag(REST_FLAG_IN_TAVERN))
+            return "toast";
+        if (bot->GetHealthPct() < 50.0f)
+            return "sigh";
+        if (bot->IsMounted())
+            return "wave";
+        if (bot->GetGroup())
+            return urand(0, 1) == 0 ? "nod" : "salute";
+
+        static char const* gestures[] = { "wave", "nod", "shrug" };
+        return gestures[urand(0, sizeof(gestures) / sizeof(gestures[0]) - 1)];
+    }
 }
 
 BotMindsAmbientChatter::BotMindsAmbientChatter() : WorldScript("BotMindsAmbientChatter") {}
 
 void BotMindsAmbientChatter::OnUpdate(uint32 diff)
 {
-    if (!g_Enable || !g_EnableAmbientChatter)
+    if (!g_Enable || (!g_EnableAmbientChatter && !g_ActionsEnable))
         return;
 
     static uint32 timer = 0;
@@ -224,90 +396,163 @@ void BotMindsAmbientChatter::OnUpdate(uint32 diff)
 
     const time_t now = time(nullptr);
 
+    struct AmbientCandidate
+    {
+        Player* bot = nullptr;
+        AmbientDestination destination;
+    };
+
+    std::unordered_map<ScopeKey, std::vector<AmbientCandidate>, ScopeKeyHash> scenes;
+    std::unordered_map<uint64_t, std::vector<Player*>> nearbyBots;
+
     for (auto const& pair : ObjectAccessor::GetPlayers())
     {
         Player* bot = pair.second;
         if (!bot || !IsBot(bot) || !bot->IsInWorld() || bot->IsBeingTeleported())
             continue;
-        if (g_DisableRepliesInCombat && bot->IsInCombat())
-            continue;
 
-        const uint64_t guid = bot->GetGUID().GetRawValue();
+        bool const canAct = !g_DisableRepliesInCombat || !bot->IsInCombat();
 
-        // Cheap gates first. The audience check walks every player, and the
-        // surroundings scan hits the grid, so neither runs until this bot is
-        // actually due to say something.
-        auto scheduled = g_NextAmbientTime.find(guid);
-        if (scheduled == g_NextAmbientTime.end())
+        if (g_ActionsEnable && canAct)
         {
-            g_NextAmbientTime[guid] = now + urand(g_AmbientMinIntervalSec, g_AmbientMaxIntervalSec);
-            continue;
+            if (Player* audience = NearestRealPlayer(bot, g_SayDistance))
+                nearbyBots[audience->GetGUID().GetRawValue()].push_back(bot);
         }
 
-        if (now < scheduled->second)
-            continue;
-
-        g_NextAmbientTime[guid] = now + urand(g_AmbientMinIntervalSec, g_AmbientMaxIntervalSec);
-
-        if (urand(0, 99) >= g_AmbientChance)
-            continue;
-
-        // Idle chatter needs someone to hear it. A group-mate always qualifies,
-        // at any distance, the same way it can already answer party chat from
-        // across the map. Everyone else has to be inside say range, since that is
-        // what "can a person hear this" means for a line spoken out loud.
-        //
-        // Guild membership deliberately does not qualify a bot: a party is four
-        // bots, a guild can be hundreds, and that let every guilded bot in the
-        // world chatter into guild chat.
-        const bool groupAudience = RealPlayerInGroup(bot);
-        if (!groupAudience && !RealPlayerWithin(bot, g_SayDistance))
-            continue;
-
-        // Sometimes, rather than remarking on the scenery, do somebody a good turn.
-        // Naming the person as the turn's counterpart is what puts the capability
-        // list in the prompt, so the bot can pick a real buff and say why.
-        Player* favourFor = FavourCandidate(bot, now);
-
-        // A warrior has nothing to offer. Without this check it would still be told
-        // to do someone a good turn, and would promise a buff it does not have.
-        if (favourFor)
+        if (g_EnableAmbientChatter)
         {
-            ActionMenu offer = BuildActionMenu(bot, favourFor, /*unprompted=*/true);
-            if (offer.NothingToVolunteer())
-                favourFor = nullptr;
+            for (AmbientDestination& destination : FindDestinations(bot))
+                scenes[destination.key].push_back({ bot, std::move(destination) });
         }
+    }
 
-        std::string situation;
+    std::unordered_set<uint64_t> usedBots;
+    TryPasserbyBuffs(nearbyBots, now, usedBots);
 
-        if (favourFor)
-        {
-            situation = SafeFormat("{} is nearby and you could do them a good turn unasked", favourFor->GetName());
-        }
+    if (!g_EnableAmbientChatter)
+        return;
+
+    // Forget scenes with no current audience. If they become active again later,
+    // they receive a fresh interval rather than firing an overdue line at once.
+    for (auto iterator = g_AmbientSchedules.begin(); iterator != g_AmbientSchedules.end();)
+    {
+        if (scenes.find(iterator->first) == scenes.end())
+            iterator = g_AmbientSchedules.erase(iterator);
         else
-        {
-            std::vector<std::string> observations = ObserveSurroundings(bot);
-            if (observations.empty())
-                situation = "nothing much is happening";
-            else
-                situation = observations[urand(0, observations.size() - 1)];
+            ++iterator;
+    }
 
-            situation = SafeFormat("{}. Take this angle: {}.", situation, PickAngle(groupAudience));
+    std::vector<ScopeKey> sceneOrder;
+    sceneOrder.reserve(scenes.size());
+    for (auto const& entry : scenes)
+        sceneOrder.push_back(entry.first);
+    std::shuffle(sceneOrder.begin(), sceneOrder.end(), RandomEngine::Instance());
+
+    for (ScopeKey const& sceneKey : sceneOrder)
+    {
+        std::vector<AmbientCandidate>& candidates = scenes[sceneKey];
+        bool const hasAvailableBot = std::any_of(
+            candidates.begin(), candidates.end(), [](AmbientCandidate const& candidate)
+            {
+                return candidate.bot && (!g_DisableRepliesInCombat || !candidate.bot->IsInCombat());
+            });
+
+        auto scheduled = g_AmbientSchedules.find(sceneKey);
+        if (scheduled == g_AmbientSchedules.end())
+        {
+            AmbientSchedule schedule;
+            schedule.dueAt = now + urand(g_AmbientMinIntervalSec, g_AmbientMaxIntervalSec);
+            schedule.pausedAt = hasAvailableBot ? 0 : now;
+            g_AmbientSchedules.emplace(sceneKey, schedule);
+            continue;
         }
 
-        // Talk to the group when a person is in it, otherwise say it out loud.
-        // Checking for a person rather than just a group matters: a bot in an
-        // all-bot party used to mutter into a party channel nobody was reading.
-        ChatScope scope = groupAudience ? ChatScope::Party : ChatScope::Say;
+        AmbientSchedule& schedule = scheduled->second;
+        if (!hasAvailableBot)
+        {
+            if (schedule.pausedAt == 0)
+                schedule.pausedAt = now;
+            continue;
+        }
+
+        if (schedule.pausedAt != 0)
+        {
+            schedule.dueAt += now - schedule.pausedAt;
+            schedule.pausedAt = 0;
+        }
+
+        if (now < schedule.dueAt)
+            continue;
+
+        // A failed scene roll retries on the next 30-second coordinator tick.
+        // Once somebody actually speaks, the full configured quiet interval begins.
+        if (urand(0, 99) >= g_AmbientChance)
+        {
+            schedule.dueAt = now + 30;
+            continue;
+        }
+
+        std::shuffle(candidates.begin(), candidates.end(), RandomEngine::Instance());
+
+        auto chosen = std::find_if(candidates.begin(), candidates.end(), [&](AmbientCandidate const& candidate)
+        {
+            return candidate.bot && (!g_DisableRepliesInCombat || !candidate.bot->IsInCombat())
+                && usedBots.count(candidate.bot->GetGUID().GetRawValue()) == 0;
+        });
+        if (chosen == candidates.end())
+        {
+            schedule.dueAt = now + 30;
+            continue;
+        }
+
+        Player* bot = chosen->bot;
+        AmbientDestination const& destination = chosen->destination;
+
+        if (g_WorldLifeEnable && g_IdleGestureChance > 0
+            && urand(0, 99) < g_IdleGestureChance)
+        {
+            Player* audience = NearestRealPlayer(bot, g_SayDistance);
+            if (audience)
+            {
+                if (uint32_t const emote = ResolveEmote(
+                    bot->GetGUID().GetRawValue(), ContextualGesture(bot)))
+                {
+                    SubmitBotEmote(bot->GetGUID().GetRawValue(), audience->GetGUID().GetRawValue(), emote);
+                    usedBots.insert(bot->GetGUID().GetRawValue());
+                    schedule.dueAt = now + urand(g_AmbientMinIntervalSec, g_AmbientMaxIntervalSec);
+                    continue;
+                }
+            }
+        }
+
+        std::vector<std::string> observations = ObserveSurroundings(bot);
+        std::string situation = observations.empty()
+            ? "nothing much is happening"
+            : observations[urand(0, observations.size() - 1)];
+
+        situation = SafeFormat("{}. Take this angle: {}.", situation,
+                               PickAngle(destination.scope == ChatScope::Party));
 
         TurnRequest request;
         request.bot     = bot;
-        request.other   = favourFor;
         request.kind    = TurnKind::Ambient;
-        request.key     = MakeScope(scope, bot);
+        request.key     = destination.key;
         request.trigger = situation;
+        request.channelName = destination.channelName;
 
-        if (RequestBotTurn(request, /*forced=*/false) && favourFor)
-            g_LastFavourAt[favourFor->GetGUID().GetRawValue()] = now;
+        if (RequestBotTurn(request, /*priority=*/false))
+        {
+            usedBots.insert(bot->GetGUID().GetRawValue());
+            schedule.dueAt = now + urand(g_AmbientMinIntervalSec, g_AmbientMaxIntervalSec);
+            if (g_DebugEnabled)
+            {
+                LOG_INFO("server.loading", "[BotMinds] Ambient {} scene chose {} from {} eligible bot(s).",
+                         ScopeName(destination.scope), bot->GetName(), candidates.size());
+            }
+        }
+        else
+        {
+            schedule.dueAt = now + 30;
+        }
     }
 }

@@ -17,6 +17,7 @@ public:
 
     static bool HandleStatus(ChatHandler* handler);
     static bool HandleReload(ChatHandler* handler);
+    static bool HandleTest(ChatHandler* handler, Acore::ChatCommands::Tail prompt);
     static bool HandlePersona(ChatHandler* handler, std::string botName);
     static bool HandleMemory(ChatHandler* handler, std::string botName);
     static bool HandleRelationships(ChatHandler* handler, std::string botName);

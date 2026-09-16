@@ -25,6 +25,7 @@ enum class ActionKind : uint8_t
     None = 0,
     Buff,
     Heal,
+    Resurrect,
     GiveGold,
     Follow,
     Stay,
@@ -43,13 +44,6 @@ struct ActionMenu
     bool                     canTakeOrders = false;
     std::string              goldRefusal;    // why not, in plain words, for the prompt
 
-    // Anything a bot would walk up and offer. Refreshable buffs deliberately do
-    // not count: nobody wants a stranger recasting a buff they already have.
-    bool NothingToVolunteer() const
-    {
-        return buffs.empty() && heals.empty();
-    }
-
     bool Empty() const
     {
         return buffs.empty() && refreshable.empty() && heals.empty()
@@ -67,13 +61,22 @@ struct PendingMemory
     float       salience = 0.5f;
 };
 
+// The most useful missing buff one bot could give a passerby. Score is only for
+// comparing choices in the same scan; 0 means every available spell was
+// inappropriate for the target's class or current situation.
+struct PasserbyBuffChoice
+{
+    std::string spellName;
+    uint32_t score = 0;
+};
+
 // A decided action, carrying only values so it can cross a thread boundary.
 struct BotAction
 {
     ActionKind  kind = ActionKind::None;
     uint64_t    botGuid = 0;
     uint64_t    targetGuid = 0;
-    std::string spellName;         // Buff / Heal
+    std::string spellName;         // Buff / Heal / Resurrect
     std::string command;           // Follow / Stay
     uint32_t    emoteId = 0;       // Emote
     uint32_t    copper = 0;        // GiveGold
@@ -108,6 +111,16 @@ uint32_t ResolveEmote(uint64_t botGuid, const std::string& name);
 // health: if you ask for one, you get one.
 ActionMenu BuildActionMenu(Player* bot, Player* other, bool unprompted = false);
 
+// Rank a bot's available buffs for an unasked passerby cast. This keeps emergency
+// and situational spells out of casual use, chooses class-appropriate blessings,
+// and does not replace an existing paladin blessing.
+PasserbyBuffChoice ChoosePasserbyBuff(Player* bot, Player* other, const ActionMenu& menu);
+
+// Pick a spell the bot can cast right now to help a nearby stranger recover.
+// Heals require a living, hurt, out-of-combat target; resurrection requires a
+// dead target without an offer already waiting. Empty means this bot cannot help.
+std::string ChooseRecoverySpell(Player* bot, Player* other, bool resurrect);
+
 // The menu rendered for the prompt. Empty string when the menu is empty.
 std::string DescribeActionMenu(const ActionMenu& menu, const std::string& otherName);
 
@@ -118,11 +131,15 @@ bool ValidateAction(const ActionMenu& menu, BotAction& action);
 // Safe from any thread. Runs on the next world tick.
 void SubmitBotAction(const BotAction& action);
 
+// Queue an embodiment-only emote. This is independent of Actions.Enable: player
+// emote reactions are presentation, not an LLM-selected gameplay action.
+void SubmitBotEmote(uint64_t botGuid, uint64_t targetGuid, uint32_t emoteId);
+
 // Drained from BotMindsConfigWorldScript::OnUpdate, on the world thread.
 void RunPendingActions(uint32_t diff);
 
-// Note that a bot just spoke to somebody, so it should stand still and face them
-// for a moment rather than wandering off mid-sentence. Safe from any thread.
+// Hold a bot still and face somebody from the time it accepts a local turn through
+// the quiet period after delivery. Safe from any thread.
 void HoldStillForConversation(uint64_t botGuid, uint64_t targetGuid);
 
 // Keeps held bots planted. Also from the world tick.

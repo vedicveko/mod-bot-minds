@@ -1,34 +1,41 @@
 #ifndef MOD_BOT_MINDS_LLMCLIENT_H
 #define MOD_BOT_MINDS_LLMCLIENT_H
 
-#include <string>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
+
 #include <nlohmann/json.hpp>
 
-// Result of one bot_turn call.
 struct LLMResult
 {
-    bool        ok = false;              // a usable response came back
-    bool        shouldReply = true;      // the bot chose to speak
+    bool ok = false;
+    bool shouldReply = true;
     std::string reply;
-    std::string emote;                   // optional gesture name, rate limited before use
-    nlohmann::json memory_additions = nlohmann::json::array();   // [{kind,text,salience}]
-    nlohmann::json relationship_delta = nullptr;                 // {affinity_change, reason} or null
-    nlohmann::json action = nullptr;                             // {kind, spell, copper} or null
+    std::string emote;
+    std::string error;
+    nlohmann::json memory_additions = nlohmann::json::array();
+    nlohmann::json relationship_delta = nullptr;
+    nlohmann::json action = nullptr;
 };
 
 class ILLMProvider
 {
 public:
     virtual ~ILLMProvider() = default;
-    virtual LLMResult Complete(const std::string& systemPrompt, const std::string& userPrompt) = 0;
+    virtual LLMResult Complete(std::string const& systemPrompt, std::string const& userPrompt) const = 0;
 };
 
+using LLMProviderPtr = std::shared_ptr<ILLMProvider const>;
+
 // Trim and clean a raw model reply: strip quoting, emotes and newlines, then cut
-// to `maxChars` on a sentence or word boundary rather than mid-word.
+// to maxChars on a sentence or word boundary rather than mid-word.
 std::string SanitizeReply(std::string reply, size_t maxChars);
 
-void InitLLMProviders();      // build the provider from config; call after config load
-ILLMProvider* GetProvider();  // null if unusable, in which case bots stay silent
+// Replaces the provider atomically. Requests already queued retain the provider
+// snapshot they started with, so a live reload cannot invalidate their client.
+void InitLLMProviders();
+LLMProviderPtr GetProvider();
 
 #endif // MOD_BOT_MINDS_LLMCLIENT_H

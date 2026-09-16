@@ -1,6 +1,7 @@
 #include "mod-bot-minds_command.h"
 #include "mod-bot-minds_action.h"
 #include "mod-bot-minds_config.h"
+#include "mod-bot-minds_dispatch.h"
 #include "mod-bot-minds_governor.h"
 #include "mod-bot-minds_llmclient.h"
 #include "mod-bot-minds_memory.h"
@@ -63,6 +64,7 @@ ChatCommandTable BotMindsConfigCommand::GetCommands() const
     {
         { "status",   HandleStatus,        SEC_ADMINISTRATOR, Console::Yes },
         { "reload",   HandleReload,        SEC_ADMINISTRATOR, Console::Yes },
+        { "test",     HandleTest,          SEC_ADMINISTRATOR, Console::Yes },
         { "persona",  HandlePersona,       SEC_ADMINISTRATOR, Console::Yes },
         { "memory",   HandleMemory,        SEC_ADMINISTRATOR, Console::Yes },
         { "feelings", HandleRelationships, SEC_ADMINISTRATOR, Console::Yes },
@@ -83,16 +85,33 @@ bool BotMindsConfigCommand::HandleStatus(ChatHandler* handler)
                                         g_Enable ? "enabled" : "disabled", g_CloudProvider, g_CloudModel));
 
     if (!GetProvider())
-        handler->SendSysMessage("BotMinds: no usable provider, bots are silent. Check BotMinds.ApiKey.");
+        handler->SendSysMessage(
+            "BotMinds: no usable provider, bots are silent. Check BotMinds.ApiKey or BotMinds.ApiKeyEnv.");
+
+    if (g_CloudProvider == "ollama")
+        handler->SendSysMessage(fmt::format("BotMinds: Ollama endpoint {}.", g_ProviderUrl));
 
     handler->SendSysMessage(fmt::format("BotMinds: reply limit {} chars, up to {} bots per line, "
                                         "{}s per-bot cooldown, at most {} calls a minute.",
                                         g_MaxReplyChars, g_MaxBotsToPick, g_PerBotCooldownSec,
                                         g_MaxCallsPerMinute));
 
-    handler->SendSysMessage(fmt::format("BotMinds: {} API calls since startup, {} in flight.",
+    handler->SendSysMessage(fmt::format("BotMinds: {} gameplay API calls since startup, {} in flight.",
                                         BotMindsGovernor::CallsSinceStartup(),
                                         BotMindsGovernor::CallsInFlight()));
+    handler->SendSysMessage(fmt::format("BotMinds: {} replies blocked by pacing, {} by repetition.",
+                                        BotMindsGovernor::PacingBlocked(),
+                                        BotMindsGovernor::RepetitionsBlocked()));
+
+    BotMindsDispatchStats const dispatch = BotMindsDispatch_GetStats();
+    handler->SendSysMessage(fmt::format(
+        "BotMinds: dispatcher {} workers, {} queued, {} calling, {} awaiting delivery; "
+        "{} submitted, {} completed, {} failed, {} queue drops, last call {}ms.",
+        dispatch.workers, dispatch.queued, dispatch.inFlight, dispatch.awaitingDelivery,
+        dispatch.submitted, dispatch.completed, dispatch.failed,
+        dispatch.droppedQueueFull, dispatch.lastLatencyMs));
+    if (!dispatch.lastError.empty())
+        handler->SendSysMessage(fmt::format("BotMinds: last provider error: {}", dispatch.lastError));
 
     handler->SendSysMessage(fmt::format("BotMinds: actions {}, {} performed, {} given up on.",
                                         g_ActionsEnable ? "enabled" : "disabled",
@@ -123,6 +142,24 @@ bool BotMindsConfigCommand::HandleReload(ChatHandler* handler)
     return true;
 }
 
+bool BotMindsConfigCommand::HandleTest(ChatHandler* handler, Tail prompt)
+{
+    if (prompt.empty())
+    {
+        handler->SendSysMessage("Usage: .botminds test <prompt>");
+        return true;
+    }
+
+    if (!BotMindsDispatch_SubmitTest(std::string(prompt)))
+    {
+        handler->SendSysMessage("BotMinds: test could not be queued. Check provider and dispatcher status.");
+        return true;
+    }
+
+    handler->SendSysMessage("BotMinds: test queued; the result will be written to the server log.");
+    return true;
+}
+
 bool BotMindsConfigCommand::HandlePersona(ChatHandler* handler, std::string botName)
 {
     std::string resolved;
@@ -141,9 +178,26 @@ bool BotMindsConfigCommand::HandlePersona(ChatHandler* handler, std::string botN
     }
 
     Field* fields = result->Fetch();
+    PersonaProfile const profile = GeneratePersonaProfile(guid);
     handler->SendSysMessage(fmt::format("BotMinds: {} ({})", resolved, fields[0].Get<std::string>()));
-    handler->SendSysMessage(fmt::format("  traits: {}", fields[1].Get<std::string>()));
-    handler->SendSysMessage(fmt::format("  speech: {}", fields[2].Get<std::string>()));
+    handler->SendSysMessage(fmt::format("  temperament: {}", profile.temperament));
+    handler->SendSysMessage(fmt::format("  interests: {}", profile.interests));
+    handler->SendSysMessage(fmt::format("  voice: {}", profile.voice));
+
+    std::string const traits = fields[1].Get<std::string>();
+    if (!traits.empty() && !IsLegacyGeneratedTraits(traits))
+        handler->SendSysMessage(fmt::format("  custom traits: {}", traits));
+
+    std::string const speechStyle = fields[2].Get<std::string>();
+    if (!speechStyle.empty() && !IsLegacyGeneratedSpeechStyle(speechStyle))
+        handler->SendSysMessage(fmt::format("  custom speech: {}", speechStyle));
+
+    if (Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(guid)))
+    {
+        std::string const mood = DescribePersonaMood(bot);
+        if (!mood.empty())
+            handler->SendSysMessage(fmt::format("  mood: {}", mood));
+    }
 
     std::string backstory = fields[3].Get<std::string>();
     if (!backstory.empty())
@@ -160,7 +214,7 @@ bool BotMindsConfigCommand::HandleMemory(ChatHandler* handler, std::string botNa
         return true;
 
     QueryResult result = CharacterDatabase.Query(SafeFormat(
-        "SELECT subject_guid, kind, text, salience, created_at FROM mod_bot_minds_memory "
+        "SELECT subject_guid, kind, text, salience, created_at, action_state FROM mod_bot_minds_memory "
         "WHERE bot_guid = {} ORDER BY id DESC LIMIT 25", guid));
 
     if (!result)
@@ -175,9 +229,11 @@ bool BotMindsConfigCommand::HandleMemory(ChatHandler* handler, std::string botNa
     {
         Field* fields = result->Fetch();
         std::string subject = fields[0].IsNull() ? "general" : NameForGuid(fields[0].Get<uint64_t>());
-        handler->SendSysMessage(fmt::format("  [{}] {} ({:.2f}) {} - {}",
-                                            subject, fields[1].Get<std::string>(), fields[3].Get<float>(),
-                                            fields[4].Get<std::string>(), fields[2].Get<std::string>()));
+        std::string const state = fields[5].Get<std::string>();
+        std::string const lifecycle = state == "none" ? "" : fmt::format("/{}", state);
+        handler->SendSysMessage(fmt::format(
+            "  [{}] {}{} ({:.2f}) {} - {}", subject, fields[1].Get<std::string>(), lifecycle,
+            fields[3].Get<float>(), fields[4].Get<std::string>(), fields[2].Get<std::string>()));
     } while (result->NextRow());
 
     return true;

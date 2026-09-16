@@ -162,7 +162,7 @@ namespace
         if (scope == ChatScope::Whisper && !whisperTarget)
             return;
 
-        ScopeKey key = MakeScope(scope, player, whisperTarget, channelId);
+        ScopeKey key = MakeScope(scope, player, whisperTarget, channelId, channelName);
 
         if (g_DebugEnabled)
             LOG_INFO("server.loading", "[BotMinds] {} in {}: {}", player->GetName(), ScopeName(scope), msg);

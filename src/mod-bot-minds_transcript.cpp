@@ -1,8 +1,11 @@
 #include "mod-bot-minds_transcript.h"
 #include "mod-bot-minds_config.h"
 
+#include "Channel.h"
+#include "DBCStores.h"
 #include "Group.h"
 #include "Player.h"
+#include "PlayerbotAI.h"
 
 #include <ctime>
 #include <deque>
@@ -12,6 +15,20 @@
 
 namespace
 {
+    bool ChannelNameContainsArea(std::string const& channelName, AreaTableEntry const* area)
+    {
+        if (!area)
+            return false;
+
+        for (uint8_t locale = 0; locale < 16; ++locale)
+        {
+            char const* areaName = area->area_name[locale];
+            if (areaName && *areaName && channelName.find(areaName) != std::string::npos)
+                return true;
+        }
+        return false;
+    }
+
     struct Line
     {
         std::string name;
@@ -23,14 +40,6 @@ namespace
     {
         std::deque<Line> lines;
         uint32_t         lastActivitySec = 0;
-    };
-
-    struct ScopeKeyHash
-    {
-        size_t operator()(const ScopeKey& k) const
-        {
-            return (static_cast<size_t>(k.id) << 3) ^ static_cast<size_t>(k.scope);
-        }
     };
 
     // One floor per (scope, person): who that person is talking to right now.
@@ -63,7 +72,29 @@ namespace
     }
 }
 
-ScopeKey MakeScope(ChatScope scope, Player* actor, Player* counterpart, uint32_t channelId)
+bool IsInChannelInstance(Player* player, Channel const* channel)
+{
+    if (!player || !channel || !player->IsInChannel(channel))
+        return false;
+
+    switch (channel->GetChannelId())
+    {
+        case ChatChannelId::GENERAL:
+        case ChatChannelId::LOCAL_DEFENSE:
+            return ChannelNameContainsArea(channel->GetName(), GetAreaEntryByAreaID(player->GetZoneId()));
+        case ChatChannelId::TRADE:
+        case ChatChannelId::GUILD_RECRUITMENT:
+            return ChannelNameContainsArea(channel->GetName(), GetAreaEntryByAreaID(3459));
+        case ChatChannelId::LOOKING_FOR_GROUP:
+        case ChatChannelId::WORLD_DEFENSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+ScopeKey MakeScope(ChatScope scope, Player* actor, Player* counterpart,
+                   uint32_t channelId, const std::string& channelName)
 {
     ScopeKey key;
     key.scope = scope;
@@ -71,20 +102,45 @@ ScopeKey MakeScope(ChatScope scope, Player* actor, Player* counterpart, uint32_t
     switch (scope)
     {
         case ChatScope::Say:
-            key.id = actor ? actor->GetZoneId() : 0;
+        {
+            Player* audience = counterpart ? counterpart : actor;
+            key.id = audience ? audience->GetGUID().GetRawValue() : 0;
             break;
+        }
         case ChatScope::Party:
             if (actor && actor->GetGroup())
-                key.id = actor->GetGroup()->GetGUID().GetCounter();
+                key.id = actor->GetGroup()->GetGUID().GetRawValue();
             break;
         case ChatScope::Guild:
             key.id = actor ? actor->GetGuildId() : 0;
             break;
         case ChatScope::Channel:
-            key.id = channelId;
+        {
+            // DBC channel ids identify a kind of channel, not an instance. Every
+            // localized General channel is id 1, and the Alliance and Horde have
+            // separate managers. Hash all three pieces so transcripts, pacing and
+            // ambient scheduling describe the channel the player can really hear.
+            uint64_t hash = 14695981039346656037ULL;
+            auto mix = [&](unsigned char byte)
+            {
+                hash ^= byte;
+                hash *= 1099511628211ULL;
+            };
+
+            uint32_t const team = actor ? static_cast<uint32_t>(actor->GetTeamId()) : 0;
+            for (uint32_t value : {team, channelId})
+            {
+                for (uint8_t shift = 0; shift < 32; shift += 8)
+                    mix(static_cast<unsigned char>((value >> shift) & 0xff));
+            }
+            for (unsigned char character : channelName)
+                mix(character);
+
+            key.id = hash;
             break;
+        }
         case ChatScope::Whisper:
-            key.id = counterpart ? counterpart->GetGUID().GetCounter() : 0;
+            key.id = counterpart ? counterpart->GetGUID().GetRawValue() : 0;
             break;
     }
 
