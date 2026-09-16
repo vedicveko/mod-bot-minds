@@ -12,6 +12,36 @@
 
 Playerbots that talk like people. Each bot has a persona, remembers what happened to it, keeps track of how it feels about you, and follows the thread of a conversation instead of shouting over it.
 
+## How this fork differs from upstream
+
+This fork began from Tom Glenn's upstream at commit [`3af0d39`][fork-point].
+Upstream may continue in a different direction. Compared with that starting point, this fork:
+
+[fork-point]: https://github.com/tomglenn/mod-bot-minds/commit/3af0d3996fb49842b9f159d7f778b164e49e32f4
+
+- **Adds local and hosted Ollama support.** Anthropic and OpenAI remain available, while Ollama uses its native chat and
+  tool-calling API with optional Bearer authentication for Ollama Cloud. The cloud path has been exercised with
+  `qwen3.5:397b-cloud`.
+- **Moves provider calls off the world thread.** A bounded worker pool, request queue and centralized governor keep slow
+  hosted requests from blocking gameplay and put explicit limits on concurrency, queue depth and call rate.
+- **Strengthens conversational routing.** Direct remarks, targets, names, follow-ups and small groups receive more
+  predictable attention. Generated lines are checked for repetition, requested game actions are validated against the
+  bot's real capabilities, and optional typing delays make replies feel less instantaneous.
+- **Expands ambient life.** Scene-wide timers prevent crowds from becoming chatter walls, pause naturally during combat,
+  and can route eligible remarks to party or configured numbered channels. Contextual gestures sometimes replace paid
+  model calls.
+- **Adds practical social behavior.** Bots can choose useful class-appropriate buffs, heal or resurrect nearby players,
+  react to player emotes, and acknowledge effective help without requiring an LLM request.
+- **Adds shared-world continuity.** Parties can react to zones, towns, dungeons and bosses, remember meaningful shared
+  experiences, form bot-to-bot relationships, greet returning acquaintances and say goodbye to known groupmates.
+- **Gives prompts more real game context.** Bots see Playerbots travel intent and recent activity, detailed
+  quest-objective progress, nearby service NPCs, richer personality and mood data, and whether remembered quest plans
+  are still active.
+
+The result is more opinionated and has more configuration and more opportunities to spend provider tokens than the
+upstream baseline. Rate limits, cooldowns and deterministic no-provider behaviors are included to keep that
+controllable.
+
 > [!IMPORTANT]
 > **This only works on AzerothCore with Playerbots.** It needs [liyunfan1223/azerothcore-wotlk](https://github.com/liyunfan1223/azerothcore-wotlk) with [mod-playerbots](https://github.com/liyunfan1223/mod-playerbots) enabled, and it calls into the Playerbots API directly. It will not build against upstream AzerothCore, because without bots there is nobody for it to give a mind to.
 
@@ -121,7 +151,11 @@ AiPlayerbot.RandomBotSayWithoutMaster = 0
 
 ## Providers
 
-**Anthropic is the tested path.** Everything in this repo was built and run against Claude Haiku 4.5, and that is what the defaults point at.
+**Ollama Cloud is the tested path for this fork.** Live testing used `qwen3.5:397b-cloud` through Ollama's native chat
+and tool-calling API.
+
+**Anthropic is the original upstream's tested path and remains supported.** The defaults still point to Claude Haiku
+4.5, so existing upstream configurations do not silently change provider.
 
 **The OpenAI provider is untested.** It is wired up, it compiles, it sends the `bot_turn` tool to `/v1/chat/completions` and parses tool calls back out, and as far as the documented API goes the shape is right. But no call has ever been made through it. It sends `max_completion_tokens` and falls back to `max_tokens` if the API rejects that, and any non-200 response is logged with the API's own error text, so if bots go quiet the server log should tell you why. Treat a failure there as a bug worth reporting rather than a wall.
 
