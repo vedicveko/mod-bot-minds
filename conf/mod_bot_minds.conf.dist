@@ -33,11 +33,11 @@ BotMinds.DebugShowFullPrompt = 0
 #     Description: "anthropic", "openai" or "ollama". All need tool calling,
 #                  which the memory and action systems depend on.
 #
-#                  Anthropic is the tested path. The OpenAI provider is wired up
-#                  but has never had a call made through it; if you select it and
-#                  bots stay silent, the server log will carry the API's own
-#                  error text. Ollama supports both a local server and direct
-#                  Ollama Cloud access through BotMinds.Url.
+#                  This fork has been tested against Ollama Cloud using
+#                  qwen3.5:397b-cloud. Anthropic is the upstream-tested path.
+#                  OpenAI is wired up but has not had a live call made through
+#                  it. Ollama supports both a local server and direct Ollama
+#                  Cloud access through BotMinds.Url.
 #     Default:     "anthropic"
 BotMinds.Provider = "anthropic"
 

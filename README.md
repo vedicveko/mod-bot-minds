@@ -97,7 +97,7 @@ rewriting the underlying personality. `.botminds persona <bot>` shows both the p
 
 ```bash
 cd /path/to/azerothcore/modules
-git clone https://github.com/tomglenn/mod-bot-minds.git
+git clone https://github.com/vedicveko/mod-bot-minds.git
 ```
 
 Rebuild the worldserver:
